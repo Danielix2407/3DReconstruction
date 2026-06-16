@@ -2937,11 +2937,11 @@ int main() {
 		std::cout << "Reconstruction algorithm:\n";
 		std::cout << "  1. NUAGES              (EMA augmentation only, no IMA)\n";
 		std::cout << "  2. NUAGES AUGMENTED    (EMA + IMA augmentation)\n";
-		std::cout << "  3. 2D Shape Similarity (not yet implemented)\n";
-		std::cout << "Select (1-2): ";
+		std::cout << "  3. 2D Shape Similarity (per-group Delaunay)\n";
+		std::cout << "Select (1-3): ";
 		std::cin >> recon_algo;
-		if (recon_algo < 1 || recon_algo > 2) recon_algo = 2;
-		std::cout << "Algorithm: " << (recon_algo == 1 ? "NUAGES" : "NUAGES AUGMENTED") << "\n";
+		if (recon_algo < 1 || recon_algo > 3) recon_algo = 2;
+		std::cout << "Algorithm: " << (recon_algo == 1 ? "NUAGES" : recon_algo == 3 ? "2D SHAPE SIMILARITY" : "NUAGES AUGMENTED") << "\n";
 
 		startIdx = rangeStart;
 		endIdx = rangeEnd;
@@ -3153,6 +3153,10 @@ int main() {
 		std::vector<std::array<index_t, 3>> accum_faces_t1_valid, accum_faces_t2_valid, accum_faces_t12_valid;
 		std::vector<std::array<index_t, 4>> accum_tet_verts;
 
+		// Algo 3 per-group independent Delaunay accumulators
+		std::vector<Eigen::Vector3d> algo3_all_pts_multi;
+		index_t algo3_voffset_multi = 0;
+
 		// shared helpers for the isolated-filter hash set
 		auto make_fk_p2 = [](index_t a, index_t b, index_t c) -> std::array<index_t,3> {
 			std::array<index_t,3> f={a,b,c};
@@ -3304,12 +3308,9 @@ int main() {
 				}
 				std::cout << "  Algo3 shape groups for pair: " << pair_fg.size() << "\n";
 
-				// one Delaunay for all pair points, then filter per group
-				Delaunay_var del3p = Delaunay::create(3, "BDEL");
-				del3p->set_vertices(N3d, coords_3d.data());
-				index_t nb_tp = del3p->nb_cells();
-				std::cout << "  Tets=" << nb_tp << "\n";
+				double z_l1p = levels[idxL1].zCoord, z_l2p = levels[idxL2].zCoord;
 
+				// Per-group independent Delaunay
 				for (int gidx=0;gidx<(int)pair_fg.size();++gidx) {
 					const auto& fg2 = pair_fg[gidx];
 					std::cout << "    Group " << (gidx+1) << "/" << pair_fg.size() << "\n";
@@ -3330,114 +3331,104 @@ int main() {
 					gg_l1g.precompute(gr_l1g,gp_l1g,gc_l1g);
 					gg_l2g.precompute(gr_l2g,gp_l2g,gc_l2g);
 
-					std::vector<t1_t2_tet_info> gt1g,gt2g;
-					std::vector<t12_tet_info>   gt12g;
+					// Compute group IMA/EMA
+					auto gvor_l1 = compute_voronoi_edges(resample_contours(gc_l1g, resampleFactor));
+					auto gma_l1 = classify_voronoi_edges(gvor_l1, gr_l1g, gp_l1g, gc_l1g, &gg_l1g);
+					auto gvor_l2 = compute_voronoi_edges(resample_contours(gc_l2g, resampleFactor));
+					auto gma_l2 = classify_voronoi_edges(gvor_l2, gr_l2g, gp_l2g, gc_l2g, &gg_l2g);
+					auto gproj_l2_on_l1 = compute_ema_projection(gma_l2.ema_edges, gr_l1g, gp_l1g, gc_l1g, &gg_l1g);
+					auto gproj_l1_on_l2 = compute_ema_projection(gma_l1.ema_edges, gr_l2g, gp_l2g, gc_l2g, &gg_l2g);
 
-					for(index_t tt=0;tt<nb_tp;++tt){
-						const signed_index_t* v=del3p->cell_to_v()+4*tt;
+					// Build group augmented points
+					std::vector<Eigen::Vector3d> gaug_l1g, gaug_l2g;
+					for (const auto& c : resample_contours(gc_l1g, resampleFactor)) for (const auto& p : c.points) gaug_l1g.push_back(p);
+					for (const auto& e : gma_l1.ima_edges) { gaug_l1g.emplace_back(e.first.x,e.first.y,z_l1p); gaug_l1g.emplace_back(e.second.x,e.second.y,z_l1p); }
+					for (const auto& v : gproj_l2_on_l1.solid_vertices) gaug_l1g.emplace_back(v.x(),v.y(),z_l1p);
+					for (const auto& c : resample_contours(gc_l2g, resampleFactor)) for (const auto& p : c.points) gaug_l2g.push_back(p);
+					for (const auto& e : gma_l2.ima_edges) { gaug_l2g.emplace_back(e.first.x,e.first.y,z_l2p); gaug_l2g.emplace_back(e.second.x,e.second.y,z_l2p); }
+					for (const auto& v : gproj_l1_on_l2.solid_vertices) gaug_l2g.emplace_back(v.x(),v.y(),z_l2p);
+
+					index_t n1gg=(index_t)gaug_l1g.size(), n2gg=(index_t)gaug_l2g.size(), N3dgg=n1gg+n2gg;
+					if (N3dgg < 4) continue;
+
+					std::vector<double> cgg; cgg.reserve(N3dgg*3);
+					for(const auto& p:gaug_l1g){cgg.push_back(p.x());cgg.push_back(p.y());cgg.push_back(p.z());}
+					for(const auto& p:gaug_l2g){cgg.push_back(p.x());cgg.push_back(p.y());cgg.push_back(p.z());}
+
+					// Global offset for this group's vertices
+					index_t group_voff = algo3_voffset_multi;
+					algo3_voffset_multi += N3dgg;
+					for (const auto& p : gaug_l1g) algo3_all_pts_multi.push_back(p);
+					for (const auto& p : gaug_l2g) algo3_all_pts_multi.push_back(p);
+
+					Delaunay_var del3g = Delaunay::create(3, "BDEL");
+					del3g->set_vertices(N3dgg, cgg.data());
+					index_t nb_tg = del3g->nb_cells();
+					std::cout << "      Tets=" << nb_tg << "\n";
+
+					int g_t1v=0,g_t2v=0,g_t12v=0;
+					for(index_t tt=0;tt<nb_tg;++tt){
+						const signed_index_t* v=del3g->cell_to_v()+4*tt;
 						int cnt1=0;
 						index_t vl1l[2]={},vl2l[2]={}; int cl1=0,cl2=0;
 						for(int lv=0;lv<4;++lv){
-							if(static_cast<index_t>(v[lv])<n_l1_pts){cnt1++;if(cl1<2)vl1l[cl1++]=static_cast<index_t>(v[lv]);}
+							if(static_cast<index_t>(v[lv])<n1gg){cnt1++;if(cl1<2)vl1l[cl1++]=static_cast<index_t>(v[lv]);}
 							else{if(cl2<2)vl2l[cl2++]=static_cast<index_t>(v[lv]);}
 						}
 						if(cnt1==3||cnt1==1){
 							bool in_l1=(cnt1==3);
 							index_t bv[3]; int bc=0; index_t av=0;
 							for(int lv=0;lv<4;++lv){
-								bool ib=in_l1?(static_cast<index_t>(v[lv])<n_l1_pts):(static_cast<index_t>(v[lv])>=n_l1_pts);
+								bool ib=in_l1?(static_cast<index_t>(v[lv])<n1gg):(static_cast<index_t>(v[lv])>=n1gg);
 								if(ib) bv[bc++]=static_cast<index_t>(v[lv]); else av=static_cast<index_t>(v[lv]);
 							}
-							double cx=(coords_3d[3*bv[0]]+coords_3d[3*bv[1]]+coords_3d[3*bv[2]])/3.0;
-							double cy=(coords_3d[3*bv[0]+1]+coords_3d[3*bv[1]+1]+coords_3d[3*bv[2]+1])/3.0;
+							double cx=(cgg[3*bv[0]]+cgg[3*bv[1]]+cgg[3*bv[2]])/3.0;
+							double cy=(cgg[3*bv[0]+1]+cgg[3*bv[1]+1]+cgg[3*bv[2]+1])/3.0;
 							const SolidRegionGrid& bg2=in_l1?gg_l1g:gg_l2g;
 							if(bg2.classify(cx,cy)<0) continue;
-
-							t1_t2_tet_info info; info.type=in_l1?1:2;
-							info.base_verts[0]=bv[0];info.base_verts[1]=bv[1];info.base_verts[2]=bv[2]; info.apex_vert=av;
-							for(int lv=0;lv<4;++lv) info.orig_verts[lv]=static_cast<index_t>(v[lv]);
-							for(int lf=0;lf<4;++lf) info.faces[lf]={to_global(v[fvp2[lf][0]]),to_global(v[fvp2[lf][1]]),to_global(v[fvp2[lf][2]])};
-							info.centroid_x=cx; info.centroid_y=cy; info.centroid_in_solid=true;
-							info.fails_midpoint=false; info.void_l1_count=0; info.void_l2_count=0;
-							{
-								const double st[3]={2./5.,0.5,3./5.}; bool av1=true,av2=true;
-								for(int be=0;be<3;++be){
-									double bx=coords_3d[3*info.base_verts[be]],by=coords_3d[3*info.base_verts[be]+1];
-									double ax=coords_3d[3*info.apex_vert],ay=coords_3d[3*info.apex_vert+1];
-									for(int si=0;si<3;++si){
-										double mx=bx+st[si]*(ax-bx),my=by+st[si]*(ay-by);
-										info.midpoint_x[be][si]=mx; info.midpoint_y[be][si]=my;
-										info.midpoint_in_solid_l1[be][si]=(gg_l1g.classify(mx,my)>=0);
-										info.midpoint_in_solid_l2[be][si]=(gg_l2g.classify(mx,my)>=0);
-										if(!info.midpoint_in_solid_l1[be][si]) info.void_l1_count++;
-										if(!info.midpoint_in_solid_l2[be][si]) info.void_l2_count++;
-										if(info.midpoint_in_solid_l1[be][si]) av1=false;
-										if(info.midpoint_in_solid_l2[be][si]) av2=false;
-									}
+							bool av1=true,av2=true;
+							const double st[3]={2./5.,0.5,3./5.};
+							for(int be=0;be<3&&(av1||av2);++be){
+								double bx=cgg[3*bv[be]],by=cgg[3*bv[be]+1];
+								double ax=cgg[3*av],ay=cgg[3*av+1];
+								for(int si=0;si<3&&(av1||av2);++si){
+									double mx=bx+st[si]*(ax-bx),my=by+st[si]*(ay-by);
+									if(gg_l1g.classify(mx,my)>=0) av1=false;
+									if(gg_l2g.classify(mx,my)>=0) av2=false;
 								}
-								if(av1&&av2) info.fails_midpoint=true;
 							}
-							if(in_l1) gt1g.push_back(info); else gt2g.push_back(info);
+							if(av1&&av2) continue;
+							cnt_t1v+=in_l1?1:0; cnt_t2v+=in_l1?0:1;
+							g_t1v+=in_l1?1:0; g_t2v+=in_l1?0:1;
+							index_t gv[4];
+							for(int lv=0;lv<4;++lv) gv[lv]=group_voff+static_cast<index_t>(v[lv]);
+							if(in_l1){
+								tv_t1.push_back({gv[0],gv[1],gv[2],gv[3]});
+								for(int lf=0;lf<4;++lf) fv_t1.push_back({gv[fvp2[lf][0]],gv[fvp2[lf][1]],gv[fvp2[lf][2]]});
+							} else {
+								tv_t2.push_back({gv[0],gv[1],gv[2],gv[3]});
+								for(int lf=0;lf<4;++lf) fv_t2.push_back({gv[fvp2[lf][0]],gv[fvp2[lf][1]],gv[fvp2[lf][2]]});
+							}
 						}
 						else if(cnt1==2){
-							double mx1=(coords_3d[3*vl1l[0]]+coords_3d[3*vl1l[1]])*0.5;
-							double my1=(coords_3d[3*vl1l[0]+1]+coords_3d[3*vl1l[1]+1])*0.5;
-							double mx2=(coords_3d[3*vl2l[0]]+coords_3d[3*vl2l[1]])*0.5;
-							double my2=(coords_3d[3*vl2l[0]+1]+coords_3d[3*vl2l[1]+1])*0.5;
+							double mx1=(cgg[3*vl1l[0]]+cgg[3*vl1l[1]])*0.5,my1=(cgg[3*vl1l[0]+1]+cgg[3*vl1l[1]+1])*0.5;
 							int r1=gg_l1g.classify(mx1,my1);
 							if(r1<0){Eigen::Vector2d m1v(mx1,my1);if(point_near_contour_boundary(m1v,gr_l1g,gp_l1g,gc_l1g)) r1=0;}
+							if(r1<0) continue;
+							double mx2=(cgg[3*vl2l[0]]+cgg[3*vl2l[1]])*0.5,my2=(cgg[3*vl2l[0]+1]+cgg[3*vl2l[1]+1])*0.5;
 							int r2=gg_l2g.classify(mx2,my2);
 							if(r2<0){Eigen::Vector2d m2v(mx2,my2);if(point_near_contour_boundary(m2v,gr_l2g,gp_l2g,gc_l2g)) r2=0;}
-							if(r1<0||r2<0) continue;
-							t12_tet_info info; info.fails_midpoint=false; info.fails_isolated=false; info.fails_group_affinity=false;
-							for(int lv=0;lv<4;++lv) info.verts[lv]=to_global(static_cast<index_t>(v[lv]));
-							for(int lf=0;lf<4;++lf) info.faces[lf]={to_global(v[fvp2[lf][0]]),to_global(v[fvp2[lf][1]]),to_global(v[fvp2[lf][2]])};
-							gt12g.push_back(info);
+							if(r2<0) continue;
+							cnt_t12v++; g_t12v++;
+							index_t gv[4];
+							for(int lv=0;lv<4;++lv) gv[lv]=group_voff+static_cast<index_t>(v[lv]);
+							tv_t12.push_back({gv[0],gv[1],gv[2],gv[3]});
+							for(int lf=0;lf<4;++lf) fv_t12.push_back({gv[fvp2[lf][0]],gv[fvp2[lf][1]],gv[fvp2[lf][2]]});
 						}
 					}
-
-					std::vector<std::array<index_t,3>> gfv_t1g,gfv_t2g;
-					for(const auto& info:gt1g){
-						bool valid=info.centroid_in_solid&&!(global_filter_t1_midpoint&&info.fails_midpoint);
-						if(valid){ cnt_t1v++;
-							tv_t1.push_back({to_global(info.orig_verts[0]),to_global(info.orig_verts[1]),to_global(info.orig_verts[2]),to_global(info.orig_verts[3])});
-							for(int lf=0;lf<4;++lf){ fv_t1.push_back(info.faces[lf]); gfv_t1g.push_back(info.faces[lf]); }
-						}
-					}
-					for(const auto& info:gt2g){
-						bool valid=info.centroid_in_solid&&!(global_filter_t2_midpoint&&info.fails_midpoint);
-						if(valid){ cnt_t2v++;
-							tv_t2.push_back({to_global(info.orig_verts[0]),to_global(info.orig_verts[1]),to_global(info.orig_verts[2]),to_global(info.orig_verts[3])});
-							for(int lf=0;lf<4;++lf){ fv_t2.push_back(info.faces[lf]); gfv_t2g.push_back(info.faces[lf]); }
-						}
-					}
-					// isolated filter for this group's T12
-					{
-						std::unordered_set<std::array<index_t,3>,FaceHashP2> rf2;
-						for(const auto& f:gfv_t1g) rf2.insert(make_fk_p2(f[0],f[1],f[2]));
-						for(const auto& f:gfv_t2g) rf2.insert(make_fk_p2(f[0],f[1],f[2]));
-						size_t n12g=gt12g.size();
-						std::vector<bool> reach(n12g,false);
-						bool fc=true;
-						while(fc){ fc=false;
-							for(size_t i=0;i<n12g;++i){
-								if(gt12g[i].fails_midpoint||reach[i]) continue;
-								for(int lf=0;lf<4;++lf)
-									if(rf2.count(make_fk_p2(gt12g[i].faces[lf][0],gt12g[i].faces[lf][1],gt12g[i].faces[lf][2])))
-										{reach[i]=true;for(int lf2=0;lf2<4;++lf2) rf2.insert(make_fk_p2(gt12g[i].faces[lf2][0],gt12g[i].faces[lf2][1],gt12g[i].faces[lf2][2]));fc=true;break;}
-							}
-						}
-						for(size_t i=0;i<n12g;++i) if(!reach[i]) gt12g[i].fails_isolated=true;
-					}
-					for(const auto& info:gt12g){
-						if(!info.fails_midpoint&&!info.fails_isolated&&!info.fails_group_affinity){
-							cnt_t12v++;
-							tv_t12.push_back({info.verts[0],info.verts[1],info.verts[2],info.verts[3]});
-							for(int lf=0;lf<4;++lf) fv_t12.push_back(info.faces[lf]);
-						}
-					}
-					std::cout << "      T1v=" << cnt_t1v << " T2v=" << cnt_t2v << " T12v=" << cnt_t12v << "\n";
-				} // end group loop
+					std::cout << "      T1v=" << g_t1v << " T2v=" << g_t2v << " T12v=" << g_t12v << "\n";
+				} // end per-group loop
+				std::cout << "    pair T1v=" << cnt_t1v << " T2v=" << cnt_t2v << " T12v=" << cnt_t12v << "\n";
 			}
 			// ============================================================
 			// ALGO 1 / 2 / 4: single Delaunay per pair, full T1/T2/T12 filters
@@ -3610,6 +3601,14 @@ int main() {
 		all_valid_faces.insert(all_valid_faces.end(), accum_faces_t2_valid.begin(), accum_faces_t2_valid.end());
 		all_valid_faces.insert(all_valid_faces.end(), accum_faces_t12_valid.begin(), accum_faces_t12_valid.end());
 
+		// For algo3: rebuild V3d_multi from per-group accumulated points
+		if (recon_algo == 3 && algo3_voffset_multi > 0) {
+			total_global_pts = algo3_voffset_multi;
+			V3d_multi.resize(total_global_pts, 3);
+			for (index_t i = 0; i < total_global_pts; ++i)
+				V3d_multi.row(i) = algo3_all_pts_multi[i].transpose();
+		}
+
 		std::cout << "\n=================================\n";
 		std::cout << "MULTI-SECTION TOTALS\n";
 		std::cout << "  Total vertices: " << total_global_pts << "\n";
@@ -3655,6 +3654,8 @@ int main() {
 			// These uncanceled caps appear as internal "floors" in the skin.
 			// Fix: after boundary_facets, drop every face whose 3 vertices all share
 			// the same z-value that belongs to an INTERIOR level of the range.
+			// Skip for algo3: per-group vertices are independent and don't have shared interior caps.
+			if (recon_algo != 3)
 			{
 				// Build set of interior z-values (not the first nor last level)
 				std::set<double> interior_z;
@@ -5227,7 +5228,7 @@ int main() {
 		// =========================
 		// ALGORITHM 3: PER-GROUP RECONSTRUCTION
 		// =========================
-		if (false) { // algo 3 per-group Delaunay replaced: now uses single Delaunay + same filters as algo 4 with 2D similarity affinity groups
+		if (recon_algo == 3) { // algo 3: independent Delaunay per depurated group
 			std::cout << "\n=================================\n";
 			std::cout << "ALGORITHM 3: PER-GROUP RECONSTRUCTION\n";
 			std::cout << "=================================\n";
@@ -5732,13 +5733,11 @@ int main() {
 				if (igl::writeOBJ(obj_path, V_fb, F_fb_r))
 					std::cout << "  OBJ: " << obj_path << "\n";
 			}
-		} // end algo 3 (disabled)
-
-		{
+		} else {
 
 		// =========================
-		// ALGO 1/2/3/4: SINGLE DELAUNAY + FILTERS
-		// (algo 3 uses same filters as algo 4 with 2D shape similarity groups for affinity)
+		// ALGO 1/2/4: SINGLE DELAUNAY + FILTERS
+		// (algo 3 is handled above with per-group Delaunay)
 		// =========================
 		struct SimpleGroup4 {
 			std::vector<int> l1_contour_ids;
@@ -6673,8 +6672,8 @@ int main() {
 				// Applied AFTER all standard filters. Removes tets whose base
 				// and apex/opposite segment belong to different mapping groups.
 				// =========================
-				if ((recon_algo == 3 || recon_algo == 4) && !algo4_groups.empty()) {
-					std::cout << "\n=== " << (recon_algo == 3 ? "ALGO3" : "ALGO4") << " Group Affinity Filter ===\n";
+				if (recon_algo == 4 && !algo4_groups.empty()) {
+					std::cout << "\n=== ALGO4 Group Affinity Filter ===\n";
 
 					auto find_group_l1 = [&](double x, double y) -> int {
 						for (int gi = 0; gi < (int)algo4_groups.size(); ++gi)
