@@ -5,12 +5,12 @@ list(PREPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
 # Libigl
 include(libigl)
-
+include(geogram)
 # Enable the target igl::glfw
 igl_include(glfw)
 # Other modules you could enable
 #igl_include(embree)
-#igl_include(imgui)
+igl_include(imgui)
 #igl_include(opengl)
 #igl_include(stb)
 #igl_include(predicates)
@@ -33,7 +33,8 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
   igl::glfw
   ## Other modules you could link to
   # igl::embree
-  # igl::imgui
+   igl::imgui
+   geogram
   # igl::opengl
   # igl::stb
   # igl::predicates
@@ -47,3 +48,6 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
   # igl_restricted::mosek
   # igl_restricted::triangle
   )
+ target_include_directories(${PROJECT_NAME} PRIVATE
+    ${geogram_SOURCE_DIR}/src/lib
+)
