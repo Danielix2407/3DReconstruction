@@ -716,24 +716,66 @@ std::vector<datapoints> resample_contours(
 {
 	if (factor <= 1) return contours;
 
+	constexpr double eps_len = 1e-12;
 	std::vector<datapoints> result;
+	result.reserve(contours.size());
+
 	for (const auto& contour : contours) {
 		datapoints resampled;
-		const auto& pts = contour.points;
-		for (size_t i = 0; i < pts.size(); ++i) {
-			const auto& p0 = pts[i];
-			const auto& p1 = pts[(i + 1) % pts.size()];
-			resampled.points.push_back(p0);
-			for (int k = 1; k < factor; ++k) {
-				double t = static_cast<double>(k) / factor;
-				Eigen::Vector3d mid = p0 + t * (p1 - p0);
-				resampled.points.push_back(mid);
+		std::vector<Eigen::Vector3d> pts = contour.points;
+
+		if (pts.size() < 3) {
+			resampled.points = pts;
+			resampled.compute_bbox();
+			result.push_back(resampled);
+			continue;
+		}
+
+		if ((pts.front() - pts.back()).norm() < eps_len)
+			pts.pop_back();
+
+		int n = static_cast<int>(pts.size());
+		int target = n * factor;
+		if (target < 3) target = 3;
+
+		struct Seg { Eigen::Vector3d a, b; double start, len; };
+		std::vector<Seg> segs;
+		double perimeter = 0.0;
+
+		for (int i = 0; i < n; ++i) {
+			int j = (i + 1) % n;
+			double len = (pts[j] - pts[i]).norm();
+			if (len <= eps_len) continue;
+			segs.push_back({pts[i], pts[j], perimeter, len});
+			perimeter += len;
+		}
+
+		if (perimeter <= eps_len || segs.empty()) {
+			resampled.points = contour.points;
+			resampled.compute_bbox();
+			result.push_back(resampled);
+			continue;
+		}
+
+		resampled.points.reserve(target);
+		for (int k = 0; k < target; ++k) {
+			double d = perimeter * static_cast<double>(k) / target;
+			for (const auto& s : segs) {
+				if (d >= s.start && d < s.start + s.len) {
+					double t = (d - s.start) / s.len;
+					resampled.points.emplace_back(
+						s.a.x() + t * (s.b.x() - s.a.x()),
+						s.a.y() + t * (s.b.y() - s.a.y()),
+						s.a.z() + t * (s.b.z() - s.a.z()));
+					break;
+				}
 			}
 		}
+
+		resampled.compute_bbox();
 		result.push_back(resampled);
 	}
-	for (auto& c : result)
-		c.compute_bbox();
+
 	return result;
 }
 
@@ -1442,29 +1484,64 @@ bool generate_cnt_from_obj(const std::string& obj_path, const std::string& cnt_p
 		return false;
 	}
 
+	// ---------------------------------------------------------------
+	// Compute uniform scale factor from global bounding box (x/y/z)
+	// ---------------------------------------------------------------
+	double bb_min_x = V.col(0).minCoeff(), bb_max_x = V.col(0).maxCoeff();
+	double bb_min_y = V.col(1).minCoeff(), bb_max_y = V.col(1).maxCoeff();
+	double bb_min_z = z_min, bb_max_z = z_max;
+	double range_x = bb_max_x - bb_min_x;
+	double range_y = bb_max_y - bb_min_y;
+	double range_z = bb_max_z - bb_min_z;
+	double max_range = std::max({range_x, range_y, range_z});
+
+	double cnt_scale    = 1.0;
+	double cnt_offset_x = 0.0;
+	double cnt_offset_y = 0.0;
+	double cnt_offset_z = 0.0;
+
+	if (scale_coords) {
+		double target_size = 1000.0; // all coordinates fit in [0, target_size]
+		if (max_range > 1e-10)
+			cnt_scale = target_size / max_range;
+		cnt_offset_x = bb_min_x;
+		cnt_offset_y = bb_min_y;
+		cnt_offset_z = bb_min_z;
+		std::cout << "CNT scaling enabled:\n";
+		std::cout << "  Scale factor: " << cnt_scale << " (target " << target_size << " / range " << max_range << ")\n";
+		std::cout << "  Offset: (" << cnt_offset_x << ", " << cnt_offset_y << ", " << cnt_offset_z << ")\n";
+	} else {
+		std::cout << "CNT scaling disabled: writing raw coordinates.\n";
+	}
+
+	// Apply scale to Z range for slice computation
+	double Z0 = (z_min - cnt_offset_z) * cnt_scale;
+	double Z1 = (z_max - cnt_offset_z) * cnt_scale;
+	double ZR = Z1 - Z0;
+
 	// Generate slice Z values (exclude exact min/max to avoid degenerate slices)
-	// Base spacing between slices
-	double margin = z_range / (num_slices + 1);
+	double margin = ZR / (num_slices + 1);
 	std::vector<double> slice_z;
 
-	// Small tolerance for vertex coincidence
 	double tol_snap = 1e-12;
 
-	// Epsilon base: fraction of inter-slice distance. We'll try to nudge
-	// slices that fall exactly on vertex Z by +/- (margin/100) (and grow
-	// if needed) instead of removing that slice.
 	double eps_base = std::max(margin / 100.0, 1e-12);
 
+	// Pre-scale all vertices for slice intersection
+	Eigen::MatrixXd Vs(V.rows(), 3);
+	for (int vi = 0; vi < V.rows(); ++vi) {
+		Vs(vi, 0) = (V(vi, 0) - cnt_offset_x) * cnt_scale;
+		Vs(vi, 1) = (V(vi, 1) - cnt_offset_y) * cnt_scale;
+		Vs(vi, 2) = (V(vi, 2) - cnt_offset_z) * cnt_scale;
+	}
+
 	for (int i = 1; i <= num_slices; ++i) {
-		double z = z_min + i * margin;
+		double z = Z0 + i * margin;
 		double original_z = z;
 
-		// If a slice lies exactly on a vertex Z (within tol), try to nudge it
-		// slightly (prefer + direction) so we don't lose information.
 		bool collision = false;
-		for (int vi = 0; vi < (int)V.rows(); ++vi) {
-			double vz = V(vi, 2);
-			if (std::abs(vz - z) <= tol_snap) { collision = true; break; }
+		for (int vi = 0; vi < (int)Vs.rows(); ++vi) {
+			if (std::abs(Vs(vi, 2) - z) <= tol_snap) { collision = true; break; }
 		}
 		if (collision) {
 			double eps = eps_base;
@@ -1472,18 +1549,17 @@ bool generate_cnt_from_obj(const std::string& obj_path, const std::string& cnt_p
 			for (int attempt = 0; attempt < 40 && !moved; ++attempt) {
 				double z_plus = original_z + eps;
 				double z_minus = original_z - eps;
-				// prefer moving upward if inside range
-				if (z_plus < z_max - 1e-12) {
+				if (z_plus < Z1 - 1e-12) {
 					bool ok = true;
-					for (int vi = 0; vi < (int)V.rows(); ++vi) if (std::abs(V(vi,2) - z_plus) <= tol_snap) { ok = false; break; }
+					for (int vi = 0; vi < (int)Vs.rows(); ++vi) if (std::abs(Vs(vi,2) - z_plus) <= tol_snap) { ok = false; break; }
 					if (ok) { z = z_plus; moved = true; break; }
 				}
-				if (z_minus > z_min + 1e-12) {
+				if (z_minus > Z0 + 1e-12) {
 					bool ok = true;
-					for (int vi = 0; vi < (int)V.rows(); ++vi) if (std::abs(V(vi,2) - z_minus) <= tol_snap) { ok = false; break; }
+					for (int vi = 0; vi < (int)Vs.rows(); ++vi) if (std::abs(Vs(vi,2) - z_minus) <= tol_snap) { ok = false; break; }
 					if (ok) { z = z_minus; moved = true; break; }
 				}
-				eps *= 2.0; // increase and retry
+				eps *= 2.0;
 			}
 			if (moved) {
 				std::cout << "  [SLICE ADJUST] slice " << i << " adjusted from " << original_z << " to " << z << " to avoid vertex plane\n";
@@ -1497,7 +1573,6 @@ bool generate_cnt_from_obj(const std::string& obj_path, const std::string& cnt_p
 
 	std::cout << "Generating " << num_slices << " slices...\n";
 
-	// Tolerance for snapping endpoints to the same grid cell
 	const double tol = 1e-8;
 	using KeyT = std::pair<long long, long long>;
 	auto make_key = [&](const Eigen::Vector2d& p) -> KeyT {
@@ -1505,32 +1580,132 @@ bool generate_cnt_from_obj(const std::string& obj_path, const std::string& cnt_p
 				static_cast<long long>(std::round(p.y() / tol))};
 	};
 
-	// First pass: collect all level data into memory so we can count levels
 	struct SliceData {
 		double z;
 		std::vector<std::vector<Eigen::Vector2d>> contours;
 	};
 	std::vector<SliceData> all_slices;
 
+	// Segment-segment intersection test (strict: interior crossing only)
+	auto seg_intersect = [](
+		double ax, double ay, double bx, double by,
+		double cx, double cy, double dx, double dy) -> bool
+	{
+		double denom = (bx-ax)*(dy-cy) - (by-ay)*(dx-cx);
+		if (std::abs(denom) < 1e-15) return false;
+		double t = ((cx-ax)*(dy-cy) - (cy-ay)*(dx-cx)) / denom;
+		double u = ((cx-ax)*(by-ay) - (cy-ay)*(bx-ax)) / denom;
+		return (t > 1e-9 && t < 1.0-1e-9 && u > 1e-9 && u < 1.0-1e-9);
+	};
+
+	// Polygon area (absolute, 2D)
+	auto poly_area = [](const std::vector<Eigen::Vector2d>& poly) -> double {
+		double a = 0.0;
+		for (size_t i = 0, j = poly.size() - 1; i < poly.size(); j = i++)
+			a += (poly[j].x() + poly[i].x()) * (poly[j].y() - poly[i].y());
+		return std::abs(a) * 0.5;
+	};
+
+	// Check if a contour is self-intersecting
+	auto has_self_intersection = [&](const std::vector<Eigen::Vector2d>& c) -> bool {
+		int n = static_cast<int>(c.size());
+		for (int i = 0; i < n; ++i) {
+			int i2 = (i + 1) % n;
+			for (int j = i + 1; j < n; ++j) {
+				if (j == i2 || (j + 1) % n == i) continue;
+				int j2 = (j + 1) % n;
+				if (seg_intersect(c[i].x(), c[i].y(), c[i2].x(), c[i2].y(),
+					c[j].x(), c[j].y(), c[j2].x(), c[j2].y()))
+					return true;
+			}
+		}
+		return false;
+	};
+
+	// Chain helper: build closed contours from segments
+	auto chain_segments = [&](const std::vector<std::pair<Eigen::Vector2d,Eigen::Vector2d>>& segs,
+		int& open_discarded) -> std::vector<std::vector<Eigen::Vector2d>>
+	{
+		std::map<KeyT, std::vector<std::pair<size_t,int>>> adj;
+		for (size_t i = 0; i < segs.size(); ++i) {
+			adj[make_key(segs[i].first)].push_back({i, 0});
+			adj[make_key(segs[i].second)].push_back({i, 1});
+		}
+
+		std::vector<bool> used(segs.size(), false);
+		std::vector<std::vector<Eigen::Vector2d>> result;
+
+		for (size_t start = 0; start < segs.size(); ++start) {
+			if (used[start]) continue;
+
+			std::deque<Eigen::Vector2d> chain;
+			chain.push_back(segs[start].first);
+			chain.push_back(segs[start].second);
+			used[start] = true;
+
+			bool growing = true;
+			while (growing) {
+				growing = false;
+				auto tail_k = make_key(chain.back());
+				auto it = adj.find(tail_k);
+				if (it != adj.end()) {
+					for (auto& se : it->second) {
+						if (used[se.first]) continue;
+						chain.push_back(se.second == 0 ? segs[se.first].second : segs[se.first].first);
+						used[se.first] = true;
+						growing = true;
+						break;
+					}
+				}
+			}
+			growing = true;
+			while (growing) {
+				growing = false;
+				auto head_k = make_key(chain.front());
+				auto it = adj.find(head_k);
+				if (it != adj.end()) {
+					for (auto& se : it->second) {
+						if (used[se.first]) continue;
+						chain.push_front(se.second == 0 ? segs[se.first].second : segs[se.first].first);
+						used[se.first] = true;
+						growing = true;
+						break;
+					}
+				}
+			}
+
+			// Accept only truly closed chains
+			if (chain.size() >= 3 && make_key(chain.front()) == make_key(chain.back())) {
+				chain.pop_back();
+				// Remove any remaining duplicate head/tail from round trip
+				if (chain.size() >= 2 && make_key(chain.front()) == make_key(chain.back()))
+					chain.pop_back();
+				result.emplace_back(chain.begin(), chain.end());
+			} else {
+				open_discarded++;
+			}
+		}
+		return result;
+	};
+
+	int total_closed_contours = 0;
+	int total_open_discarded = 0;
+	int total_intersecting_discarded = 0;
+
 	for (int si = 0; si < (int)slice_z.size(); ++si) {
 		double z = slice_z[si];
+		int open_discarded = 0;
 
 		// Find all triangle-plane intersections at this Z
-		struct Segment { Eigen::Vector2d a, b; };
-		std::vector<Segment> segments;
-
+		std::vector<std::pair<Eigen::Vector2d, Eigen::Vector2d>> segments;
 		for (int fi = 0; fi < F.rows(); ++fi) {
-			Eigen::Vector3d p0 = V.row(F(fi, 0));
-			Eigen::Vector3d p1 = V.row(F(fi, 1));
-			Eigen::Vector3d p2 = V.row(F(fi, 2));
+			Eigen::Vector3d p0 = Vs.row(F(fi, 0));
+			Eigen::Vector3d p1 = Vs.row(F(fi, 1));
+			Eigen::Vector3d p2 = Vs.row(F(fi, 2));
 
-			double d0 = p0.z() - z;
-			double d1 = p1.z() - z;
-			double d2 = p2.z() - z;
-
+			double d0 = p0.z() - z, d1 = p1.z() - z, d2 = p2.z() - z;
 			int above = (d0 > 1e-12) + (d1 > 1e-12) + (d2 > 1e-12);
 			int below = (d0 < -1e-12) + (d1 < -1e-12) + (d2 < -1e-12);
-
 			if (above == 0 || below == 0) continue;
 
 			Eigen::Vector3d pts[3] = {p0, p1, p2};
@@ -1540,149 +1715,43 @@ bool generate_cnt_from_obj(const std::string& obj_path, const std::string& cnt_p
 			for (int e = 0; e < 3 && hits.size() < 2; ++e) {
 				int ea = e, eb = (e + 1) % 3;
 				double da = dists[ea], db = dists[eb];
-
 				if ((da > 1e-12 && db < -1e-12) || (da < -1e-12 && db > 1e-12)) {
-					// Proper crossing: interpolate
 					double t = da / (da - db);
 					Eigen::Vector3d hit = pts[ea] + t * (pts[eb] - pts[ea]);
 					hits.emplace_back(hit.x(), hit.y());
-				}
-				else if (std::abs(da) <= 1e-12 && std::abs(db) > 1e-12) {
-					// Vertex ea is exactly on the plane, eb is strictly off.
-					// For a manifold mesh the 1-ring of ea has exactly 2
-					// crossing triangles, so ea will appear with degree 2 in
-					// the adjacency graph (no T-junction). Using make_key
-					// snapping ensures all triangles that share ea produce the
-					// same key, so they chain correctly.
+				} else if (std::abs(da) <= 1e-12 && std::abs(db) > 1e-12) {
 					hits.emplace_back(pts[ea].x(), pts[ea].y());
 				}
-				// Vertex eb exactly on plane is handled when that edge is
-				// visited as ea in the next triangle that shares it, so we
-				// skip the eb==0 case here to avoid duplicate hits within
-				// the same triangle.
 			}
 
-			if (hits.size() == 2) {
-				// Skip degenerate segments (both endpoints identical)
-				if (make_key(hits[0]) != make_key(hits[1]))
-					segments.push_back({hits[0], hits[1]});
-			}
+			if (hits.size() == 2 && make_key(hits[0]) != make_key(hits[1]))
+				segments.push_back({hits[0], hits[1]});
 		}
 
 		if (segments.empty()) continue;
 
-		// Chain segments into closed contours using adjacency map (O(n) per contour)
-		// Build adjacency: endpoint key -> list of (segment_index, which_end)
-		struct SegEnd { size_t seg_idx; int end; }; // end: 0=a, 1=b
-		std::map<KeyT, std::vector<SegEnd>> adj;
-		for (size_t i = 0; i < segments.size(); ++i) {
-			adj[make_key(segments[i].a)].push_back({i, 0});
-			adj[make_key(segments[i].b)].push_back({i, 1});
-		}
-
-		std::vector<bool> used(segments.size(), false);
-		std::vector<std::vector<Eigen::Vector2d>> contours;
-
-		for (size_t start = 0; start < segments.size(); ++start) {
-			if (used[start]) continue;
-
-			// Build chain using deque for O(1) push_front/push_back
-			std::deque<Eigen::Vector2d> chain;
-			chain.push_back(segments[start].a);
-			chain.push_back(segments[start].b);
-			used[start] = true;
-
-			// Grow forward: follow from tail
-			bool growing = true;
-			while (growing) {
-				growing = false;
-				auto tail_k = make_key(chain.back());
-				auto it = adj.find(tail_k);
-				if (it != adj.end()) {
-					for (auto& se : it->second) {
-						if (used[se.seg_idx]) continue;
-						// Add the OTHER endpoint of this segment
-						const auto& seg = segments[se.seg_idx];
-						Eigen::Vector2d next_pt = (se.end == 0) ? seg.b : seg.a;
-						chain.push_back(next_pt);
-						used[se.seg_idx] = true;
-						growing = true;
-						break;
-					}
-				}
-			}
-
-			// Grow backward: follow from head
-			growing = true;
-			while (growing) {
-				growing = false;
-				auto head_k = make_key(chain.front());
-				auto it = adj.find(head_k);
-				if (it != adj.end()) {
-					for (auto& se : it->second) {
-						if (used[se.seg_idx]) continue;
-						const auto& seg = segments[se.seg_idx];
-						Eigen::Vector2d prev_pt = (se.end == 0) ? seg.b : seg.a;
-						chain.push_front(prev_pt);
-						used[se.seg_idx] = true;
-						growing = true;
-						break;
-					}
-				}
-			}
-
-			// Check if closed (first == last within tolerance) and remove duplicate
-			if (chain.size() >= 3 && make_key(chain.front()) == make_key(chain.back())) {
-				chain.pop_back();
-			}
-
-			if (chain.size() >= 3) {
-				contours.emplace_back(chain.begin(), chain.end());
-			}
-		}
+		auto contours = chain_segments(segments, open_discarded);
+		total_open_discarded += open_discarded;
 
 		if (contours.empty()) continue;
 
-		// ---------------------------------------------------------------
-		// VALIDATION: closed contours + no cross-contour intersections
-		// ---------------------------------------------------------------
+		// Sort by area descending (outer contours first)
+		std::vector<std::pair<double,int>> area_idx;
+		for (int ci = 0; ci < (int)contours.size(); ++ci)
+			area_idx.push_back({poly_area(contours[ci]), ci});
+		std::sort(area_idx.begin(), area_idx.end(),
+			[](auto& a, auto& b) { return a.first > b.first; });
+
+		std::vector<std::vector<Eigen::Vector2d>> sorted;
+		for (auto& ai : area_idx) sorted.push_back(std::move(contours[ai.second]));
+		contours = std::move(sorted);
+
+		// Cross-contour intersection check + re-chain / discard
 		{
-			// Segment-segment intersection test (strict: interior crossing only)
-			auto seg_intersect = [](
-				double ax, double ay, double bx, double by,
-				double cx, double cy, double dx, double dy) -> bool
-			{
-				double denom = (bx-ax)*(dy-cy) - (by-ay)*(dx-cx);
-				if (std::abs(denom) < 1e-15) return false;
-				double t = ((cx-ax)*(dy-cy) - (cy-ay)*(dx-cx)) / denom;
-				double u = ((cx-ax)*(by-ay) - (cy-ay)*(bx-ax)) / denom;
-				return (t > 1e-9 && t < 1.0-1e-9 && u > 1e-9 && u < 1.0-1e-9);
-			};
-
 			int n_contours = static_cast<int>(contours.size());
-
-			// 1) Closure check
-			for (int ci = 0; ci < n_contours; ++ci) {
-				const auto& c = contours[ci];
-				if (c.size() < 3) {
-					std::cerr << "WARNING: slice z=" << std::fixed << std::setprecision(4) << z
-						<< " contour " << ci << " has only " << c.size() << " points (degenerate)\n";
-				}
-				// The chaining already removes the duplicate closing point,
-				// so the contour is implicitly closed (last segment goes back to first).
-				// We just verify the first and last points are NOT identical (no leftover duplicate).
-				if (c.size() >= 2 && make_key(c.front()) == make_key(c.back())) {
-					std::cerr << "WARNING: slice z=" << z
-						<< " contour " << ci << " still has duplicate first/last point\n";
-				}
-			}
-
-			// 2) Cross-contour intersection check
-			// Root cause: T-junctions in the mesh create branching points where the greedy
-			// chaining arbitrarily splits one contour into two crossing chains.
-			// Fix strategy: when two contours intersect, merge their segments and re-chain them.
 			int intersection_count = 0;
-			std::set<int> contours_to_merge; // indices of contours involved in intersections
+			std::set<int> merge_set;
+
 			for (int ci = 0; ci < n_contours; ++ci) {
 				const auto& A = contours[ci];
 				int na = static_cast<int>(A.size());
@@ -1694,8 +1763,7 @@ bool generate_cnt_from_obj(const std::string& obj_path, const std::string& cnt_p
 						int ia2 = (ia + 1) % na;
 						for (int ib = 0; ib < nb && !found; ++ib) {
 							int ib2 = (ib + 1) % nb;
-							if (seg_intersect(
-								A[ia].x(), A[ia].y(), A[ia2].x(), A[ia2].y(),
+							if (seg_intersect(A[ia].x(), A[ia].y(), A[ia2].x(), A[ia2].y(),
 								B[ib].x(), B[ib].y(), B[ib2].x(), B[ib2].y()))
 							{
 								std::cerr << "WARNING: slice z=" << std::fixed << std::setprecision(4) << z
@@ -1703,8 +1771,8 @@ bool generate_cnt_from_obj(const std::string& obj_path, const std::string& cnt_p
 									<< " intersects contour " << cj << " (size=" << nb << ")"
 									<< " at seg " << ia << "-" << ia2
 									<< " x seg " << ib << "-" << ib2 << "\n";
-								contours_to_merge.insert(ci);
-								contours_to_merge.insert(cj);
+								merge_set.insert(ci);
+								merge_set.insert(cj);
 								intersection_count++;
 								found = true;
 							}
@@ -1713,211 +1781,106 @@ bool generate_cnt_from_obj(const std::string& obj_path, const std::string& cnt_p
 				}
 			}
 
-			// --- FIX: Re-chain intersecting contours by merging their segments ---
-			if (!contours_to_merge.empty()) {
-				std::cerr << "  [FIX] Attempting to re-chain " << contours_to_merge.size()
-					<< " intersecting contour(s) at z=" << std::fixed << std::setprecision(4) << z << "\n";
-
-				// Collect all segments from the conflicting contours
-				std::vector<Segment> fix_segs;
-				for (int ci : contours_to_merge) {
+			if (!merge_set.empty()) {
+				// Re-chain intersecting contours
+				std::vector<std::pair<Eigen::Vector2d,Eigen::Vector2d>> fix_segs;
+				for (int ci : merge_set) {
 					const auto& c = contours[ci];
 					int nc = static_cast<int>(c.size());
 					for (int k = 0; k < nc; ++k)
 						fix_segs.push_back({c[k], c[(k + 1) % nc]});
 				}
 
-				// Re-chain using the same adjacency approach but prioritizing
-				// the path that keeps the contour non-self-intersecting
-				std::map<KeyT, std::vector<SegEnd>> fix_adj;
-				for (size_t i = 0; i < fix_segs.size(); ++i) {
-					fix_adj[make_key(fix_segs[i].a)].push_back({i, 0});
-					fix_adj[make_key(fix_segs[i].b)].push_back({i, 1});
-				}
+				int fix_open = 0;
+				auto fixed = chain_segments(fix_segs, fix_open);
 
-				std::vector<bool> fix_used(fix_segs.size(), false);
-				std::vector<std::vector<Eigen::Vector2d>> fixed_contours;
-
-				for (size_t start = 0; start < fix_segs.size(); ++start) {
-					if (fix_used[start]) continue;
-
-					std::deque<Eigen::Vector2d> chain;
-					chain.push_back(fix_segs[start].a);
-					chain.push_back(fix_segs[start].b);
-					fix_used[start] = true;
-
-					bool growing = true;
-					while (growing) {
-						growing = false;
-						auto tail_k = make_key(chain.back());
-						auto it = fix_adj.find(tail_k);
-						if (it != fix_adj.end()) {
-							for (auto& se : it->second) {
-								if (fix_used[se.seg_idx]) continue;
-								Eigen::Vector2d next_pt = (se.end == 0) ? fix_segs[se.seg_idx].b : fix_segs[se.seg_idx].a;
-								chain.push_back(next_pt);
-								fix_used[se.seg_idx] = true;
-								growing = true;
-								break;
-							}
-						}
-					}
-					growing = true;
-					while (growing) {
-						growing = false;
-						auto head_k = make_key(chain.front());
-						auto it = fix_adj.find(head_k);
-						if (it != fix_adj.end()) {
-							for (auto& se : it->second) {
-								if (fix_used[se.seg_idx]) continue;
-								Eigen::Vector2d prev_pt = (se.end == 0) ? fix_segs[se.seg_idx].b : fix_segs[se.seg_idx].a;
-								chain.push_front(prev_pt);
-								fix_used[se.seg_idx] = true;
-								growing = true;
-								break;
-							}
-						}
-					}
-
-					if (chain.size() >= 3 && make_key(chain.front()) == make_key(chain.back()))
-						chain.pop_back();
-					if (chain.size() >= 3)
-						fixed_contours.emplace_back(chain.begin(), chain.end());
-				}
-
-				// Replace the intersecting contours with the re-chained ones
 				std::vector<std::vector<Eigen::Vector2d>> new_contours;
-				for (int ci = 0; ci < n_contours; ++ci) {
-					if (contours_to_merge.count(ci) == 0)
-						new_contours.push_back(contours[ci]);
-				}
-				for (auto& fc : fixed_contours)
-					new_contours.push_back(std::move(fc));
+				for (int ci = 0; ci < n_contours; ++ci)
+					if (merge_set.count(ci) == 0) new_contours.push_back(std::move(contours[ci]));
+				for (auto& fc : fixed) new_contours.push_back(std::move(fc));
 				contours = std::move(new_contours);
 
-				std::cerr << "  [FIX] Re-chaining produced " << fixed_contours.size()
-					<< " contour(s) from " << contours_to_merge.size() << " intersecting ones\n";
-
-				// Re-validate after fix
+				// Re-check after fix; discard still-intersecting
+				int after_n = static_cast<int>(contours.size());
 				int remaining = 0;
-				int nc2 = static_cast<int>(contours.size());
-				for (int ci = 0; ci < nc2; ++ci) {
+				std::set<int> bad;
+				for (int ci = 0; ci < after_n; ++ci) {
 					int na = static_cast<int>(contours[ci].size());
-					for (int cj = ci + 1; cj < nc2; ++cj) {
+					for (int cj = ci + 1; cj < after_n; ++cj) {
 						int nb = static_cast<int>(contours[cj].size());
 						for (int ia = 0; ia < na; ++ia) {
 							int ia2 = (ia + 1) % na;
 							for (int ib = 0; ib < nb; ++ib) {
 								int ib2 = (ib + 1) % nb;
-								if (seg_intersect(
-									contours[ci][ia].x(), contours[ci][ia].y(),
+								if (seg_intersect(contours[ci][ia].x(), contours[ci][ia].y(),
 									contours[ci][ia2].x(), contours[ci][ia2].y(),
 									contours[cj][ib].x(), contours[cj][ib].y(),
 									contours[cj][ib2].x(), contours[cj][ib2].y()))
-								{ remaining++; goto done_recheck; }
+								{ remaining++; bad.insert(ci); bad.insert(cj); }
 							}
 						}
 					}
+					// Self-intersection check
+					if (has_self_intersection(contours[ci]))
+						bad.insert(ci);
 				}
-				done_recheck:
-				if (remaining == 0)
-					std::cerr << "  [FIX] Intersections resolved at z=" << z << "\n";
-				else
-					std::cerr << "  [FIX] " << remaining << " intersection(s) still remain at z=" << z
-						<< " (T-junction in mesh may need mesh repair)\n";
-			}
 
-			if (intersection_count == 0 && n_contours > 1) {
-				std::cout << "  [OK] slice z=" << std::fixed << std::setprecision(4) << z
-					<< ": " << n_contours << " contours, all closed, no intersections\n";
-			} else if (intersection_count > 0) {
-				std::cerr << "  [!!] slice z=" << z
-					<< ": " << intersection_count << " intersecting contour pair(s) found\n";
+				if (!bad.empty()) {
+					total_intersecting_discarded += static_cast<int>(bad.size());
+					std::vector<std::vector<Eigen::Vector2d>> keep;
+					for (int ci = 0; ci < after_n; ++ci)
+						if (bad.count(ci) == 0) keep.push_back(std::move(contours[ci]));
+					contours = std::move(keep);
+
+					if (remaining > 0)
+						std::cerr << "  [FIX] " << bad.size() << " contour(s) discarded at z=" << z
+							<< " (intersections unresolvable)\n";
+					else
+						std::cerr << "  [FIX] " << bad.size() << " self-intersecting contour(s) discarded at z=" << z << "\n";
+				} else if (remaining == 0) {
+					std::cerr << "  [FIX] Intersections resolved at z=" << z << "\n";
+				}
 			}
 		}
-		// ---------------------------------------------------------------
+
+		if (contours.empty()) continue;
 
 		SliceData sd;
 		sd.z = z;
 		sd.contours = std::move(contours);
 		all_slices.push_back(std::move(sd));
+		total_closed_contours += static_cast<int>(all_slices.back().contours.size());
 
 		int total_pts = 0;
 		for (const auto& c : all_slices.back().contours) total_pts += static_cast<int>(c.size());
 		std::cout << "  Slice " << (si + 1) << "/" << num_slices
 			<< " z=" << std::fixed << std::setprecision(4) << z
 			<< " segments=" << segments.size()
-			<< " contours=" << all_slices.back().contours.size()
+			<< " closed=" << all_slices.back().contours.size()
+			<< " open_discarded=" << open_discarded
 			<< " points=" << total_pts << "\n";
 	}
 
-	// Write CNT file with header
+	// Write CNT (S N only, no scale in header; coordinates already scaled)
 	std::ofstream out(cnt_path);
 	if (!out.is_open()) {
 		std::cerr << "ERROR: Could not open output file: " << cnt_path << "\n";
 		return false;
 	}
 
-	// Compute scale based on smallest non-zero absolute coordinate value (if requested).
-	double cnt_scale    = 1.0;
-	double cnt_offset_x = 0.0;
-	double cnt_offset_y = 0.0;
-
-	if (scale_coords) {
-		double min_abs_value = 1e30;
-		double bb_min_x = 1e30, bb_min_y = 1e30, bb_max_x = -1e30, bb_max_y = -1e30;
-
-		for (const auto& slice : all_slices) {
-			for (const auto& c : slice.contours) {
-				for (const auto& p : c) {
-					if (p.x() < bb_min_x) bb_min_x = p.x();
-					if (p.y() < bb_min_y) bb_min_y = p.y();
-					if (p.x() > bb_max_x) bb_max_x = p.x();
-					if (p.y() > bb_max_y) bb_max_y = p.y();
-					double abs_x = std::abs(p.x());
-					double abs_y = std::abs(p.y());
-					if (abs_x > 1e-10 && abs_x < min_abs_value) min_abs_value = abs_x;
-					if (abs_y > 1e-10 && abs_y < min_abs_value) min_abs_value = abs_y;
-				}
-			}
-		}
-
-		if (min_abs_value > 1e10) {
-			double range_x = bb_max_x - bb_min_x;
-			double range_y = bb_max_y - bb_min_y;
-			min_abs_value = std::min(range_x, range_y);
-		}
-
-		if (min_abs_value > 1e-10)
-			cnt_scale = 100.0 / min_abs_value;
-
-		cnt_offset_x = bb_min_x;
-		cnt_offset_y = bb_min_y;
-
-		std::cout << "CNT scaling enabled:\n";
-		std::cout << "  Scale factor: " << cnt_scale << "\n";
-		std::cout << "  Offset: (" << cnt_offset_x << ", " << cnt_offset_y << ")\n";
-	} else {
-		std::cout << "CNT scaling disabled: writing raw coordinates.\n";
-	}
-
 	int num_levels = static_cast<int>(all_slices.size());
 	out << std::fixed;
-	// Write only the level count in the S header (no scale/offset numbers).
 	out << "S " << num_levels << "\n";
 
 	int total_contours = 0;
 	for (const auto& slice : all_slices) {
 		int total_verts = 0;
 		for (const auto& c : slice.contours) total_verts += static_cast<int>(c.size());
-
-        out << "v " << total_verts << " z " << std::setprecision(10) << slice.z << "\n";
+		out << "v " << total_verts << " z " << std::setprecision(10) << slice.z << "\n";
 		for (const auto& c : slice.contours) {
 			out << "{\n";
 			for (const auto& p : c) {
-				double sx = (p.x() - cnt_offset_x) * cnt_scale;
-				double sy = (p.y() - cnt_offset_y) * cnt_scale;
-				out << std::fixed << std::setprecision(10) << sx << " " << sy << "\n";
+				out << std::fixed << std::setprecision(10) << p.x() << " " << p.y() << "\n";
 			}
 			out << "}\n";
 			total_contours++;
@@ -1925,10 +1888,19 @@ bool generate_cnt_from_obj(const std::string& obj_path, const std::string& cnt_p
 	}
 
 	out.close();
-	std::cout << "\nCNT file written: " << cnt_path << "\n";
-	std::cout << "Levels: " << num_levels
-		<< ", total contours: " << total_contours << "\n";
-	return true;
+
+	std::cout << "\n========== CNT SUMMARY ==========\n";
+	std::cout << "CNT file       : " << cnt_path << "\n";
+	std::cout << "Levels written : " << num_levels << " / " << num_slices << " requested\n";
+	std::cout << "Total contours : " << total_contours << "\n";
+	std::cout << "Open chains discarded: " << total_open_discarded << "\n";
+	std::cout << "Intersecting/self-intersecting discarded: " << total_intersecting_discarded << "\n";
+	std::cout << "Scaling        : " << (scale_coords ? "yes" : "no") << "\n";
+	if (scale_coords)
+		std::cout << "  scale=" << cnt_scale << " target=1000 range=" << max_range << "\n";
+	std::cout << "=================================\n";
+
+	return num_levels > 0;
 }
 
 // ---------------------------------------------------------------------------------------//
@@ -2247,6 +2219,7 @@ int main() {
 
 	int startIdx, endIdx;
 	int recon_algo = 2; // 1=NUAGES, 2=NUAGES_AUGMENTED, 3=2D_SHAPE_SIMILARITY
+	bool enable_2d_analysis = false;
 	char choice;
 
 	std::cout << "Do you want to visualize all sections? (Y for Yes, N for No): ";
@@ -2278,7 +2251,7 @@ int main() {
 		// ================================
 		// Resample de puntos
 		// ================================
-		std::cout << "Enter resample factor (1 = original, 2 = add midpoints, etc.): ";
+		std::cout << "Enter resample factor (1 = original, 2+ = Nx points uniformly spaced): ";
 		std::cin >> resampleFactor;
 		if (resampleFactor < 1) resampleFactor = 1;
 
@@ -2291,6 +2264,7 @@ int main() {
 		std::cin >> recon_algo;
 		if (recon_algo < 1 || recon_algo > 4) recon_algo = 2;
 		std::cout << "Algorithm: " << (recon_algo == 1 ? "NUAGES" : recon_algo == 3 ? "2D SHAPE SIMILARITY" : recon_algo == 4 ? "SIMPLIFIED 2D SHAPE SIMILARITY" : "NUAGES AUGMENTED") << "\n";
+		enable_2d_analysis = (recon_algo == 3 || recon_algo == 4);
 
 		resampled_l1 = resample_contours(levels[startIdx - 1].contours, resampleFactor);
 		resampled_l2 = resample_contours(levels[startIdx].contours, resampleFactor);
@@ -2299,10 +2273,10 @@ int main() {
 		if (resampleFactor > 1) {
 			for (size_t c = 0; c < resampled_l1.size(); ++c)
 				std::cout << "  L1 contour " << c << ": " << levels[startIdx - 1].contours[c].points.size()
-					<< " -> " << resampled_l1[c].points.size() << " points\n";
+					<< " -> " << resampled_l1[c].points.size() << " uniform points\n";
 			for (size_t c = 0; c < resampled_l2.size(); ++c)
 				std::cout << "  L2 contour " << c << ": " << levels[startIdx].contours[c].points.size()
-					<< " -> " << resampled_l2[c].points.size() << " points\n";
+					<< " -> " << resampled_l2[c].points.size() << " uniform points\n";
 		}
 
 		// ================================
@@ -2363,7 +2337,9 @@ int main() {
 		}
 
 		// Ã¢Å“â€¦ GENERAR TEXTO DEL BOSQUE L1
-		global_forest_text_l1 = format_forest_text(forest_l1, true);
+		global_forest_text_l1.clear();
+		if (enable_2d_analysis)
+			global_forest_text_l1 = format_forest_text(forest_l1, true);
 
 		// ================================
 		// ConstrucciÃƒÂ³n del bosque nivel l2
@@ -2423,7 +2399,9 @@ int main() {
 		}
 
 		// Ã¢Å“â€¦ GENERAR TEXTO DEL BOSQUE L2
-		global_forest_text_l2 = format_forest_text(forest_l2, false);
+		global_forest_text_l2.clear();
+		if (enable_2d_analysis)
+			global_forest_text_l2 = format_forest_text(forest_l2, false);
 
 		// ================================
 		// ConstrucciÃƒÂ³n de arreglo global y referencias
@@ -2520,6 +2498,7 @@ int main() {
 			}
 		}
 
+		if (enable_2d_analysis) {
 		// =======================
 		// BOSQUE NIVEL l1
 		// =======================
@@ -2647,7 +2626,7 @@ int main() {
 
 		std::cout << "=================================\n";
 
-		// ========================= COMPUTE HOLE MAPPING GROUPS + DEPURATED GROUPS (always)
+		// ========================= COMPUTE HOLE MAPPING GROUPS + DEPURATED GROUPS
 		{
 			std::vector<solidpolygon> hole_polys_l1_2d, hole_polys_l2_2d;
 			for (const auto& ref : hole_refs_l1) hole_polys_l1_2d.push_back(all_hole_polygons[ref.polygon_id]);
@@ -2690,10 +2669,6 @@ int main() {
 			// === DEPURATION ===
 			std::vector<int> sorted_2d;
 			for (int i = 0; i < (int)all_groups_2d.size(); ++i) if (!all_groups_2d[i].is_empty) sorted_2d.push_back(i);
-			// Solid groups before hole groups (within each category: deepest first).
-			// This ensures solid polygons claim ALL their contours (outer + holes)
-			// before hole groups can steal the shared inner contour IDs.
-			// E.g. for A>B>C: solid (A,B) must claim B before hole group (B,C) does.
 			std::stable_sort(sorted_2d.begin(), sorted_2d.end(), [&](int a, int b) {
 				if (all_groups_2d[a].is_solid != all_groups_2d[b].is_solid)
 					return all_groups_2d[a].is_solid > all_groups_2d[b].is_solid;
@@ -2762,6 +2737,16 @@ int main() {
 				std::cout << "=================================\n";
 			}
 		}
+		} else {
+			global_similarity_matrix.clear();
+			global_mapping_groups.clear();
+			global_hole_mapping_groups.clear();
+			global_final_groups_2d.clear();
+			hole_vs_hole_matrix.clear();
+			hole_vs_solid_matrix.clear();
+		}
+
+		if (enable_2d_analysis) {
 
 		// ========================= HOLE VS HOLE SIMILARITY
 
@@ -2915,6 +2900,7 @@ int main() {
 			}
 			std::cout << "=================================\n";
 		}
+		} // end if (enable_2d_analysis)
 	}
 	else {
 		// Multi-section reconstruction
@@ -2930,7 +2916,7 @@ int main() {
 			return -1;
 		}
 
-		std::cout << "Enter resample factor (1 = original, 2 = add midpoints, etc.): ";
+		std::cout << "Enter resample factor (1 = original, 2+ = Nx points uniformly spaced): ";
 		std::cin >> resampleFactor;
 		if (resampleFactor < 1) resampleFactor = 1;
 
@@ -2980,6 +2966,11 @@ int main() {
 
 		std::vector<PairComputed> pair_computed;
 		pair_computed.reserve(rangeEnd - rangeStart);
+
+		// ---- Pre-compute work contours for all levels ----
+		std::vector<std::vector<datapoints>> work_contours_by_level(numSections);
+		for (int li = rangeStart - 1; li < rangeEnd; ++li)
+			work_contours_by_level[li] = resample_contours(levels[li].contours, resampleFactor);
 
 		// ---- Pass 1: forest, grids, Voronoi, IMA, EMA for every pair ----
 		for (int pair = rangeStart; pair < rangeEnd; ++pair) {
@@ -3049,23 +3040,23 @@ int main() {
 				}
 			}
 
-			// Grids
-			pc.grid_l1.precompute(pc.prefs_l1, pc.polys, contours_l1_pair);
-			pc.grid_l2.precompute(pc.prefs_l2, pc.polys, contours_l2_pair);
+			// Grids (use work contours for classification consistency)
+			const auto& work_l1_pair = work_contours_by_level[idxL1];
+			const auto& work_l2_pair = work_contours_by_level[idxL2];
+			pc.grid_l1.precompute(pc.prefs_l1, pc.polys, work_l1_pair);
+			pc.grid_l2.precompute(pc.prefs_l2, pc.polys, work_l2_pair);
 
 			// Voronoi + medial axes L1
-			auto resampled_l1_pair = resample_contours(contours_l1_pair, resampleFactor);
-			auto vor_l1 = compute_voronoi_edges(resampled_l1_pair);
-			pc.ma_l1 = classify_voronoi_edges(vor_l1, pc.prefs_l1, pc.polys, contours_l1_pair, &pc.grid_l1);
+			auto vor_l1 = compute_voronoi_edges(work_l1_pair);
+			pc.ma_l1 = classify_voronoi_edges(vor_l1, pc.prefs_l1, pc.polys, work_l1_pair, &pc.grid_l1);
 
 			// Voronoi + medial axes L2
-			auto resampled_l2_pair = resample_contours(contours_l2_pair, resampleFactor);
-			auto vor_l2 = compute_voronoi_edges(resampled_l2_pair);
-			pc.ma_l2 = classify_voronoi_edges(vor_l2, pc.prefs_l2, pc.polys, contours_l2_pair, &pc.grid_l2);
+			auto vor_l2 = compute_voronoi_edges(work_l2_pair);
+			pc.ma_l2 = classify_voronoi_edges(vor_l2, pc.prefs_l2, pc.polys, work_l2_pair, &pc.grid_l2);
 
 			// EMA projections
-			pc.proj_l1_on_l2 = compute_ema_projection(pc.ma_l1.ema_edges, pc.prefs_l2, pc.polys, contours_l2_pair, &pc.grid_l2);
-			pc.proj_l2_on_l1 = compute_ema_projection(pc.ma_l2.ema_edges, pc.prefs_l1, pc.polys, contours_l1_pair, &pc.grid_l1);
+			pc.proj_l1_on_l2 = compute_ema_projection(pc.ma_l1.ema_edges, pc.prefs_l2, pc.polys, work_l2_pair, &pc.grid_l2);
+			pc.proj_l2_on_l1 = compute_ema_projection(pc.ma_l2.ema_edges, pc.prefs_l1, pc.polys, work_l1_pair, &pc.grid_l1);
 
 			std::cout << "  IMA_L1=" << pc.ma_l1.ima_edges.size()
 				<< " IMA_L2=" << pc.ma_l2.ima_edges.size()
@@ -3095,12 +3086,12 @@ int main() {
 			double z_l1 = levels[idxL1].zCoord, z_l2 = levels[idxL2].zCoord;
 
 			if (!contour_done[idxL1]) {
-				auto r = resample_contours(levels[idxL1].contours, resampleFactor);
+				const auto& r = work_contours_by_level[idxL1];
 				for (const auto& c : r) for (const auto& p : c.points) aug[idxL1].push_back(p);
 				contour_done[idxL1] = true;
 			}
 			if (!contour_done[idxL2]) {
-				auto r = resample_contours(levels[idxL2].contours, resampleFactor);
+				const auto& r = work_contours_by_level[idxL2];
 				for (const auto& c : r) for (const auto& p : c.points) aug[idxL2].push_back(p);
 				contour_done[idxL2] = true;
 			}
@@ -3320,6 +3311,9 @@ int main() {
 					for(const auto& pp:fg2.l2_side) for(int cid:pp.contour_ids) gc_l2g.push_back(contours_l2_pair[cid]);
 					if(gc_l1g.empty()||gc_l2g.empty()) continue;
 
+					auto gc_l1g_work = resample_contours(gc_l1g, resampleFactor);
+					auto gc_l2g_work = resample_contours(gc_l2g, resampleFactor);
+
 					std::vector<solidpolygon> gp_l1g,gp_l2g;
 					std::vector<polygon_reference> gr_l1g,gr_l2g;
 					{int lc=0;
@@ -3328,23 +3322,23 @@ int main() {
 					 for(const auto& pp:fg2.l2_side){ solidpolygon P; for(int k=0;k<(int)pp.contour_ids.size();++k) P.contours.push_back(lc+k); gp_l2g.push_back(P); gr_l2g.push_back(polygon_reference((int)gp_l2g.size()-1,1)); lc+=(int)pp.contour_ids.size(); }
 					}
 					SolidRegionGrid gg_l1g,gg_l2g;
-					gg_l1g.precompute(gr_l1g,gp_l1g,gc_l1g);
-					gg_l2g.precompute(gr_l2g,gp_l2g,gc_l2g);
+					gg_l1g.precompute(gr_l1g,gp_l1g,gc_l1g_work);
+					gg_l2g.precompute(gr_l2g,gp_l2g,gc_l2g_work);
 
 					// Compute group IMA/EMA
-					auto gvor_l1 = compute_voronoi_edges(resample_contours(gc_l1g, resampleFactor));
-					auto gma_l1 = classify_voronoi_edges(gvor_l1, gr_l1g, gp_l1g, gc_l1g, &gg_l1g);
-					auto gvor_l2 = compute_voronoi_edges(resample_contours(gc_l2g, resampleFactor));
-					auto gma_l2 = classify_voronoi_edges(gvor_l2, gr_l2g, gp_l2g, gc_l2g, &gg_l2g);
-					auto gproj_l2_on_l1 = compute_ema_projection(gma_l2.ema_edges, gr_l1g, gp_l1g, gc_l1g, &gg_l1g);
-					auto gproj_l1_on_l2 = compute_ema_projection(gma_l1.ema_edges, gr_l2g, gp_l2g, gc_l2g, &gg_l2g);
+					auto gvor_l1 = compute_voronoi_edges(gc_l1g_work);
+					auto gma_l1 = classify_voronoi_edges(gvor_l1, gr_l1g, gp_l1g, gc_l1g_work, &gg_l1g);
+					auto gvor_l2 = compute_voronoi_edges(gc_l2g_work);
+					auto gma_l2 = classify_voronoi_edges(gvor_l2, gr_l2g, gp_l2g, gc_l2g_work, &gg_l2g);
+					auto gproj_l2_on_l1 = compute_ema_projection(gma_l2.ema_edges, gr_l1g, gp_l1g, gc_l1g_work, &gg_l1g);
+					auto gproj_l1_on_l2 = compute_ema_projection(gma_l1.ema_edges, gr_l2g, gp_l2g, gc_l2g_work, &gg_l2g);
 
 					// Build group augmented points
 					std::vector<Eigen::Vector3d> gaug_l1g, gaug_l2g;
-					for (const auto& c : resample_contours(gc_l1g, resampleFactor)) for (const auto& p : c.points) gaug_l1g.push_back(p);
+					for (const auto& c : gc_l1g_work) for (const auto& p : c.points) gaug_l1g.push_back(p);
 					for (const auto& e : gma_l1.ima_edges) { gaug_l1g.emplace_back(e.first.x,e.first.y,z_l1p); gaug_l1g.emplace_back(e.second.x,e.second.y,z_l1p); }
 					for (const auto& v : gproj_l2_on_l1.solid_vertices) gaug_l1g.emplace_back(v.x(),v.y(),z_l1p);
-					for (const auto& c : resample_contours(gc_l2g, resampleFactor)) for (const auto& p : c.points) gaug_l2g.push_back(p);
+					for (const auto& c : gc_l2g_work) for (const auto& p : c.points) gaug_l2g.push_back(p);
 					for (const auto& e : gma_l2.ima_edges) { gaug_l2g.emplace_back(e.first.x,e.first.y,z_l2p); gaug_l2g.emplace_back(e.second.x,e.second.y,z_l2p); }
 					for (const auto& v : gproj_l1_on_l2.solid_vertices) gaug_l2g.emplace_back(v.x(),v.y(),z_l2p);
 
@@ -3411,14 +3405,84 @@ int main() {
 							}
 						}
 						else if(cnt1==2){
+							bool keep = true;
+
 							double mx1=(cgg[3*vl1l[0]]+cgg[3*vl1l[1]])*0.5,my1=(cgg[3*vl1l[0]+1]+cgg[3*vl1l[1]+1])*0.5;
 							int r1=gg_l1g.classify(mx1,my1);
-							if(r1<0){Eigen::Vector2d m1v(mx1,my1);if(point_near_contour_boundary(m1v,gr_l1g,gp_l1g,gc_l1g)) r1=0;}
-							if(r1<0) continue;
-							double mx2=(cgg[3*vl2l[0]]+cgg[3*vl2l[1]])*0.5,my2=(cgg[3*vl2l[0]+1]+cgg[3*vl2l[1]+1])*0.5;
-							int r2=gg_l2g.classify(mx2,my2);
-							if(r2<0){Eigen::Vector2d m2v(mx2,my2);if(point_near_contour_boundary(m2v,gr_l2g,gp_l2g,gc_l2g)) r2=0;}
-							if(r2<0) continue;
+							if(r1<0){Eigen::Vector2d m1v(mx1,my1);if(point_near_contour_boundary(m1v,gr_l1g,gp_l1g,gc_l1g_work)) r1=0;}
+							if(r1<0) keep = false;
+
+							if (keep) {
+								double mx2=(cgg[3*vl2l[0]]+cgg[3*vl2l[1]])*0.5,my2=(cgg[3*vl2l[0]+1]+cgg[3*vl2l[1]+1])*0.5;
+								int r2=gg_l2g.classify(mx2,my2);
+								if(r2<0){Eigen::Vector2d m2v(mx2,my2);if(point_near_contour_boundary(m2v,gr_l2g,gp_l2g,gc_l2g_work)) r2=0;}
+								if(r2<0) keep = false;
+							}
+
+							// Cross-edge + centerline check
+							if (keep) {
+								const double cross_t[3] = {0.25, 0.5, 0.75};
+								const int cross_pairs[4][2] = {{0,0},{0,1},{1,0},{1,1}};
+
+								int cross_failed_cnt = 0;
+								for (int cp = 0; cp < 4; ++cp) {
+									int li = cross_pairs[cp][0], l2i = cross_pairs[cp][1];
+									double ax = cgg[3*vl1l[li]],     ay = cgg[3*vl1l[li]+1];
+									double bx = cgg[3*vl2l[l2i]],     by = cgg[3*vl2l[l2i]+1];
+
+									bool all_outside = true;
+									for (int si = 0; si < 3 && all_outside; ++si) {
+										double mx = ax + cross_t[si] * (bx - ax);
+										double my = ay + cross_t[si] * (by - ay);
+
+										bool in_l1 = gg_l1g.classify(mx, my) >= 0;
+										if (!in_l1) {
+											Eigen::Vector2d sp(mx, my);
+											if (point_near_contour_boundary(sp, gr_l1g, gp_l1g, gc_l1g_work))
+												in_l1 = true;
+										}
+										bool in_l2 = gg_l2g.classify(mx, my) >= 0;
+										if (!in_l2) {
+											Eigen::Vector2d sp(mx, my);
+											if (point_near_contour_boundary(sp, gr_l2g, gp_l2g, gc_l2g_work))
+												in_l2 = true;
+										}
+										if (in_l1 || in_l2)
+											all_outside = false;
+									}
+									if (all_outside) cross_failed_cnt++;
+								}
+
+								// Centerline: midpoint L1-L1 -> midpoint L2-L2
+								double mid_l1_x = (cgg[3*vl1l[0]] + cgg[3*vl1l[1]]) * 0.5;
+								double mid_l1_y = (cgg[3*vl1l[0]+1] + cgg[3*vl1l[1]+1]) * 0.5;
+								double mid_l2_x = (cgg[3*vl2l[0]] + cgg[3*vl2l[1]]) * 0.5;
+								double mid_l2_y = (cgg[3*vl2l[0]+1] + cgg[3*vl2l[1]+1]) * 0.5;
+
+								bool centerline_all_outside = true;
+								for (int si = 0; si < 3 && centerline_all_outside; ++si) {
+									double mx = mid_l1_x + cross_t[si] * (mid_l2_x - mid_l1_x);
+									double my = mid_l1_y + cross_t[si] * (mid_l2_y - mid_l1_y);
+
+									bool in_l1 = gg_l1g.classify(mx, my) >= 0;
+									if (!in_l1) {
+										Eigen::Vector2d sp(mx, my);
+										if (point_near_contour_boundary(sp, gr_l1g, gp_l1g, gc_l1g_work))
+											in_l1 = true;
+									}
+									bool in_l2 = gg_l2g.classify(mx, my) >= 0;
+									if (!in_l2) {
+										Eigen::Vector2d sp(mx, my);
+										if (point_near_contour_boundary(sp, gr_l2g, gp_l2g, gc_l2g_work))
+											in_l2 = true;
+									}
+									if (in_l1 || in_l2) centerline_all_outside = false;
+								}
+
+								if (centerline_all_outside || cross_failed_cnt >= 3) keep = false;
+							}
+
+							if (!keep) continue;
 							cnt_t12v++; g_t12v++;
 							index_t gv[4];
 							for(int lv=0;lv<4;++lv) gv[lv]=group_voff+static_cast<index_t>(v[lv]);
@@ -3492,19 +3556,87 @@ int main() {
 						for(int lf=0;lf<4;++lf)
 							info.faces[lf]={to_global(v[fvp2[lf][0]]),to_global(v[fvp2[lf][1]]),to_global(v[fvp2[lf][2]])};
 						{
+							bool failed_same_level = false;
+
 							double mx1=(coords_3d[3*vl1[0]]+coords_3d[3*vl1[1]])*0.5;
 							double my1=(coords_3d[3*vl1[0]+1]+coords_3d[3*vl1[1]+1])*0.5;
 							Eigen::Vector2d m1v(mx1,my1);
 							int r1=pc.grid_l1.classify(mx1,my1);
-							if(r1<0&&point_near_contour_boundary(m1v,pc.prefs_l1,pc.polys,levels[idxL1].contours)) r1=0;
-							if(r1<0){info.fails_midpoint=true;}
+							if(r1<0&&point_near_contour_boundary(m1v,pc.prefs_l1,pc.polys,work_contours_by_level[idxL1])) r1=0;
+							if(r1<0){failed_same_level=true;}
 							else{
 								double mx2=(coords_3d[3*vl2[0]]+coords_3d[3*vl2[1]])*0.5;
 								double my2=(coords_3d[3*vl2[0]+1]+coords_3d[3*vl2[1]+1])*0.5;
 								Eigen::Vector2d m2v(mx2,my2);
 								int r2=pc.grid_l2.classify(mx2,my2);
-								if(r2<0&&point_near_contour_boundary(m2v,pc.prefs_l2,pc.polys,levels[idxL2].contours)) r2=0;
-								if(r2<0) info.fails_midpoint=true;
+								if(r2<0&&point_near_contour_boundary(m2v,pc.prefs_l2,pc.polys,work_contours_by_level[idxL2])) r2=0;
+								if(r2<0) failed_same_level=true;
+							}
+
+							// Cross-edge + centerline check
+							if (!failed_same_level) {
+								const double cross_t[3] = {0.25, 0.5, 0.75};
+								const int cross_pairs[4][2] = {{0,0},{0,1},{1,0},{1,1}};
+
+								int cross_failed_cnt = 0;
+								for (int cp = 0; cp < 4; ++cp) {
+									int li = cross_pairs[cp][0], l2i = cross_pairs[cp][1];
+									double ax = coords_3d[3*vl1[li]],     ay = coords_3d[3*vl1[li]+1];
+									double bx = coords_3d[3*vl2[l2i]],     by = coords_3d[3*vl2[l2i]+1];
+
+									bool all_outside = true;
+									for (int si = 0; si < 3 && all_outside; ++si) {
+										double mx = ax + cross_t[si] * (bx - ax);
+										double my = ay + cross_t[si] * (by - ay);
+
+										bool in_l1 = pc.grid_l1.classify(mx, my) >= 0;
+										if (!in_l1) {
+											Eigen::Vector2d sp(mx, my);
+											if (point_near_contour_boundary(sp, pc.prefs_l1, pc.polys, work_contours_by_level[idxL1]))
+												in_l1 = true;
+										}
+										bool in_l2 = pc.grid_l2.classify(mx, my) >= 0;
+										if (!in_l2) {
+											Eigen::Vector2d sp(mx, my);
+											if (point_near_contour_boundary(sp, pc.prefs_l2, pc.polys, work_contours_by_level[idxL2]))
+												in_l2 = true;
+										}
+										if (in_l1 || in_l2)
+											all_outside = false;
+									}
+									if (all_outside) cross_failed_cnt++;
+								}
+
+								// Centerline: midpoint L1-L1 -> midpoint L2-L2
+								double mid_l1_x = (coords_3d[3*vl1[0]] + coords_3d[3*vl1[1]]) * 0.5;
+								double mid_l1_y = (coords_3d[3*vl1[0]+1] + coords_3d[3*vl1[1]+1]) * 0.5;
+								double mid_l2_x = (coords_3d[3*vl2[0]] + coords_3d[3*vl2[1]]) * 0.5;
+								double mid_l2_y = (coords_3d[3*vl2[0]+1] + coords_3d[3*vl2[1]+1]) * 0.5;
+
+								bool centerline_all_outside = true;
+								for (int si = 0; si < 3 && centerline_all_outside; ++si) {
+									double mx = mid_l1_x + cross_t[si] * (mid_l2_x - mid_l1_x);
+									double my = mid_l1_y + cross_t[si] * (mid_l2_y - mid_l1_y);
+
+									bool in_l1 = pc.grid_l1.classify(mx, my) >= 0;
+									if (!in_l1) {
+										Eigen::Vector2d sp(mx, my);
+										if (point_near_contour_boundary(sp, pc.prefs_l1, pc.polys, work_contours_by_level[idxL1]))
+											in_l1 = true;
+									}
+									bool in_l2 = pc.grid_l2.classify(mx, my) >= 0;
+									if (!in_l2) {
+										Eigen::Vector2d sp(mx, my);
+										if (point_near_contour_boundary(sp, pc.prefs_l2, pc.polys, work_contours_by_level[idxL2]))
+											in_l2 = true;
+									}
+									if (in_l1 || in_l2) centerline_all_outside = false;
+								}
+
+								if (centerline_all_outside || cross_failed_cnt >= 3)
+									info.fails_midpoint = true;
+							} else {
+								info.fails_midpoint = true;
 							}
 						}
 						t12_pair.push_back(info);
@@ -3644,62 +3776,112 @@ int main() {
 			std::cout << "  Tets for boundary_facets: " << n_all_tets << "\n";
 			std::cout << "  Reoriented tets (negative det): " << reoriented << " / " << n_all_tets << "\n";
 
+			// ========== face-counting diagnostic ==========
+			{
+				auto face_key = [](int a, int b, int c) -> std::array<int,3> {
+					std::array<int,3> f = {a,b,c};
+					if (f[0] > f[1]) std::swap(f[0], f[1]);
+					if (f[1] > f[2]) std::swap(f[1], f[2]);
+					if (f[0] > f[1]) std::swap(f[0], f[1]);
+					return f;
+				};
+				std::map<std::array<int,3>, int> fcnt;
+				for (int ti = 0; ti < T_all.rows(); ++ti) {
+					fcnt[face_key(T_all(ti,1),T_all(ti,2),T_all(ti,3))]++;
+					fcnt[face_key(T_all(ti,0),T_all(ti,2),T_all(ti,3))]++;
+					fcnt[face_key(T_all(ti,0),T_all(ti,1),T_all(ti,3))]++;
+					fcnt[face_key(T_all(ti,0),T_all(ti,1),T_all(ti,2))]++;
+				}
+				int cnt1 = 0, cnt2 = 0, cnt3p = 0;
+				for (const auto& kv : fcnt) {
+					if (kv.second == 1) cnt1++;
+					else if (kv.second == 2) cnt2++;
+					else cnt3p++;
+				}
+				std::cout << "  Tet face stats: total=" << fcnt.size()
+					<< " boundary_candidates=" << cnt1
+					<< " internal_cancelled=" << cnt2
+					<< " nonmanifold=" << cnt3p << "\n";
+			}
+
 			Eigen::MatrixXi F_fb;
 			igl::boundary_facets(T_all, F_fb);
+			std::cout << "  Free boundary faces (from boundary_facets): " << F_fb.rows() << "\n";
 
-			// Remove horizontal caps at INTERIOR shared levels.
-			// The 3D Delaunay of pair (Li-1,Li) and pair (Li,Li+1) may produce
-			// different 2D triangulations of aug[Li] even when aug[Li] is identical,
-			// because the L1/L3 points influence the Delaunay differently.
-			// These uncanceled caps appear as internal "floors" in the skin.
-			// Fix: after boundary_facets, drop every face whose 3 vertices all share
-			// the same z-value that belongs to an INTERIOR level of the range.
-			// Skip for algo3: per-group vertices are independent and don't have shared interior caps.
-			if (recon_algo != 3)
+			// ---- Safe interior horizontal cap fallback ----
+			// boundary_facets cancels faces that share the same indices.
+			// If 2D triangulations differ between consecutive pairs, internal
+			// floors may survive.  Remove a horizontal face at an interior level
+			// only when solid volume exists BOTH below and above (artificial cap).
+			// Preserve caps that have volume on only one side (real geometry:
+			// cup bottoms, internal platforms, etc.)
 			{
-				// Build set of interior z-values (not the first nor last level)
-				std::set<double> interior_z;
-				for (int li = rangeStart; li < rangeEnd - 1; ++li)
-					interior_z.insert(levels[li].zCoord);
+				const double z_eps = 1e-6;
+				int dbg_tested = 0, dbg_removed = 0, dbg_kept = 0;
 
-				if (!interior_z.empty()) {
-					std::vector<int> keep;
-					keep.reserve(F_fb.rows());
-					for (int i = 0; i < F_fb.rows(); ++i) {
-						double z0 = V3d_multi(F_fb(i, 0), 2);
-						double z1 = V3d_multi(F_fb(i, 1), 2);
-						double z2 = V3d_multi(F_fb(i, 2), 2);
-						// Face is a horizontal interior cap only if all 3 z-values match
-						// the same interior level (within floating-point tolerance)
-						bool is_interior_cap = false;
-						for (double iz : interior_z) {
-							if (std::abs(z0 - iz) < 1e-9 &&
-								std::abs(z1 - iz) < 1e-9 &&
-								std::abs(z2 - iz) < 1e-9) {
-								is_interior_cap = true;
-								break;
-							}
-						}
-						if (!is_interior_cap)
-							keep.push_back(i);
+				// helper: find a computed pair by level indices
+				auto find_pair = [&](int lo, int hi) -> const PairComputed* {
+					for (const auto& pc : pair_computed)
+						if (pc.idxL1 == lo && pc.idxL2 == hi) return &pc;
+					return nullptr;
+				};
+
+				std::vector<int> keep;
+				keep.reserve(F_fb.rows());
+				for (int fi = 0; fi < F_fb.rows(); ++fi) {
+					double z0 = V3d_multi(F_fb(fi,0),2);
+					double z1 = V3d_multi(F_fb(fi,1),2);
+					double z2 = V3d_multi(F_fb(fi,2),2);
+					double zmin = std::min({z0,z1,z2});
+					double zmax = std::max({z0,z1,z2});
+
+					if (zmax - zmin >= z_eps) { keep.push_back(fi); continue; }
+
+					double zf = (z0 + z1 + z2) / 3.0;
+					int li = -1;
+					for (int lv = rangeStart-1; lv < rangeEnd; ++lv)
+						if (std::abs(zf - levels[lv].zCoord) < z_eps) { li = lv; break; }
+
+					if (li < 0) { keep.push_back(fi); continue; }
+					if (li == rangeStart-1 || li == rangeEnd-1) { keep.push_back(fi); continue; }
+
+					dbg_tested++;
+
+					double cx = (V3d_multi(F_fb(fi,0),0)+V3d_multi(F_fb(fi,1),0)+V3d_multi(F_fb(fi,2),0))/3.0;
+					double cy = (V3d_multi(F_fb(fi,0),1)+V3d_multi(F_fb(fi,1),1)+V3d_multi(F_fb(fi,2),1))/3.0;
+
+					const PairComputed* below = find_pair(li-1, li);
+					const PairComputed* above = find_pair(li, li+1);
+
+					bool sol_below = below && (below->grid_l2.classify(cx,cy) >= 0);
+					bool sol_above = above && (above->grid_l1.classify(cx,cy) >= 0);
+
+					if (sol_below && sol_above) {
+						dbg_removed++;
+						continue;
 					}
-					int removed_caps = F_fb.rows() - static_cast<int>(keep.size());
-					if (removed_caps > 0) {
-						Eigen::MatrixXi F_clean(static_cast<int>(keep.size()), 3);
-						for (int i = 0; i < static_cast<int>(keep.size()); ++i)
-							F_clean.row(i) = F_fb.row(keep[i]);
-						F_fb = F_clean;
-						std::cout << "  Removed " << removed_caps
-							<< " interior horizontal cap faces at shared levels\n";
-					}
+					dbg_kept++;
+					keep.push_back(fi);
 				}
+
+				if (dbg_tested > 0) {
+					Eigen::MatrixXi F_clean(static_cast<int>(keep.size()), 3);
+					for (size_t i = 0; i < keep.size(); ++i)
+						F_clean.row(static_cast<int>(i)) = F_fb.row(keep[i]);
+					F_fb = F_clean;
+				}
+
+				std::cout << "  Interior horizontal cap fallback:\n";
+				std::cout << "    tested interior horizontal faces: " << dbg_tested << "\n";
+				std::cout << "    removed artificial internal caps: " << dbg_removed << "\n";
+				std::cout << "    kept real horizontal caps:        " << dbg_kept << "\n";
 			}
 
 			global_faces_free_boundary.clear();
 			for (int i = 0; i < F_fb.rows(); ++i)
 				global_faces_free_boundary.push_back({static_cast<index_t>(F_fb(i,0)), static_cast<index_t>(F_fb(i,1)), static_cast<index_t>(F_fb(i,2))});
 			delaunay3d_free_boundary_faces = static_cast<int>(F_fb.rows());
-			std::cout << "  Free boundary faces (after cap removal): " << delaunay3d_free_boundary_faces << "\n";
+			std::cout << "  Free boundary faces (final): " << delaunay3d_free_boundary_faces << "\n";
 
 			// Reindex vertices for manifold check (no unreferenced vertices)
 			std::map<int, int> old_to_new;
@@ -3812,8 +3994,12 @@ int main() {
 			static_cast<float>(contour.points[0].z())
 		);
 
-		char letter = 'A' + cL1++;
-		labels.push_back({ posLabel, std::string(1, letter) });
+		if (enable_2d_analysis) {
+			char letter = 'A' + cL1++;
+			labels.push_back({ posLabel, std::string(1, letter) });
+		} else {
+			cL1++;
+		}
 
 		viewer_l1.data().add_points(V, Eigen::RowVector3d(1, 0, 0));
 
@@ -3850,7 +4036,11 @@ int main() {
 			static_cast<float>(contour.points[0].z())
 		);
 
-		labels_l2.push_back({ posLabel, std::to_string(++cL2) });
+		if (enable_2d_analysis) {
+			labels_l2.push_back({ posLabel, std::to_string(++cL2) });
+		} else {
+			++cL2;
+		}
 
 		viewer_l2.data().add_points(V, Eigen::RowVector3d(1, 0, 0));
 
@@ -3902,6 +4092,9 @@ int main() {
 	} // end if (choice == 'N') for single-pair drawing
 
 	menu_l1.callback_draw_viewer_window = [&]() {
+		if (!enable_2d_analysis) {
+			ImGui::Begin("L1"); ImGui::Text("Contours (2D analysis disabled)"); ImGui::End(); return;
+		}
 
 		ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
 		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
@@ -3984,6 +4177,9 @@ int main() {
 	};
 
 	menu_l2.callback_draw_viewer_window = [&]() {
+		if (!enable_2d_analysis) {
+			ImGui::Begin("L2"); ImGui::Text("Contours (2D analysis disabled)"); ImGui::End(); return;
+		}
 
 		ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
 		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
@@ -4349,6 +4545,12 @@ int main() {
 		viewer_overlay.data().show_faces = false;
 
 		menu_inter.callback_draw_viewer_window = [&]() {
+			if (!enable_2d_analysis) {
+				ImGui::Begin("Reconstruction");
+				ImGui::Text("Algorithm: %s", recon_algo == 1 ? "NUAGES" : "NUAGES AUGMENTED");
+				ImGui::Text("2D analysis disabled");
+				ImGui::End(); return;
+			}
 
 			// =========================
 			// VENTANA 1: SIMILARITY MATRIX
@@ -4512,7 +4714,7 @@ int main() {
 			ImGui::PopStyleColor(5);
 
 			// =========================
-			// VENTANA 3: FINAL DEPURATED GROUPS (always when available)
+			// VENTANA 3: GENERAL SOLID MAPPING GROUPS + FINAL DEPURATED GROUPS
 			// =========================
 			if (!global_final_groups_2d.empty()) {
 				ImGui::PushStyleColor(ImGuiCol_WindowBg,      ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
@@ -4521,17 +4723,86 @@ int main() {
 				ImGui::PushStyleColor(ImGuiCol_TitleBg,       ImVec4(0.85f, 0.85f, 0.85f, 1.0f));
 				ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImVec4(0.75f, 0.75f, 0.75f, 1.0f));
 
-				ImGui::SetNextWindowSize(ImVec2(520, 350), ImGuiCond_FirstUseEver);
-				ImGui::Begin("Final Depurated Groups");
+				ImGui::SetNextWindowSize(ImVec2(520, 550), ImGuiCond_FirstUseEver);
+				ImGui::Begin("Solid vs Solid Groups");
 				ImGui::SetWindowFontScale(1.5f);
-				ImGui::Text("Depurated groups");
+
+				ImGui::BeginChild("SolidGroupsScroll", ImVec2(0, 0), true);
+
+				// L2 helper: format contour ids with space separators
+				auto fmt_l2 = [&](const std::vector<int>& cids) -> std::string {
+					std::string r;
+					for (size_t j = 0; j < cids.size(); ++j) {
+						if (j) r += " ";
+						r += std::to_string(forest_l2[cids[j]].contourId + 1);
+					}
+					return r;
+				};
+
+				// lambda: print one mapping group list (solid or hole)
+				auto print_mapping_group_list = [&](const std::vector<mapping_group>& groups, const char* tag, bool is_solid) {
+					if (groups.empty()) return;
+					ImGui::Text("%s (%zu) [%s]", tag, groups.size(), is_solid ? "solid" : "hole");
+					ImGui::Separator();
+
+					const auto& refs_l1 = is_solid ? polygon_refs_l1 : hole_refs_l1;
+					const auto& refs_l2 = is_solid ? polygon_refs_l2 : hole_refs_l2;
+					const auto& polys  = is_solid ? all_polygons     : all_hole_polygons;
+
+					for (size_t g = 0; g < groups.size(); ++g) {
+						std::string s_l1, s_l2;
+						int level = std::numeric_limits<int>::max();
+
+						if (!groups[g].polygons_l1.empty()) {
+							s_l1 = "{";
+							for (size_t i = 0; i < groups[g].polygons_l1.size(); ++i) {
+								if (i) s_l1 += " ";
+								int pid = groups[g].polygons_l1[i];
+								if (pid < (int)refs_l1.size()) {
+									for (int cid : polys[refs_l1[pid].polygon_id].contours)
+										level = std::min(level, forest_l1[cid].depth);
+									s_l1 += format_polygon_name_l1(&refs_l1[pid], polys, forest_l1);
+								}
+							}
+							s_l1 += "}";
+						} else {
+							s_l1 = "{}";
+						}
+						if (!groups[g].polygons_l2.empty()) {
+							s_l2 = "{";
+							for (size_t i = 0; i < groups[g].polygons_l2.size(); ++i) {
+								if (i) s_l2 += " ";
+								int pid = groups[g].polygons_l2[i];
+								if (pid < (int)refs_l2.size()) {
+									for (int cid : polys[refs_l2[pid].polygon_id].contours)
+										level = std::min(level, forest_l2[cid].depth);
+									s_l2 += format_polygon_name_l2(&refs_l2[pid], polys, forest_l2);
+								}
+							}
+							s_l2 += "}";
+						} else {
+							s_l2 = "{}";
+						}
+						if (level == std::numeric_limits<int>::max()) level = -1;
+						ImGui::Text("%zu. %s vs %s  Level=%d", g + 1, s_l1.c_str(), s_l2.c_str(), level);
+					}
+					ImGui::Spacing();
+					ImGui::Separator();
+					ImGui::Spacing();
+				};
+
+				// ---- General mapping groups (before depuration) ----
+				print_mapping_group_list(global_mapping_groups, "Solid Mapping Groups", true);
+				print_mapping_group_list(global_hole_mapping_groups, "Hole Mapping Groups", false);
+
+				// ---- Final depurated groups ----
+				ImGui::Text("Final Depurated Groups (%zu)",
+					global_final_groups_2d.size());
 				ImGui::Separator();
 
-				ImGui::BeginChild("FinalGroupsScroll", ImVec2(0, 0), true);
 				for (int i = 0; i < (int)global_final_groups_2d.size(); ++i) {
 					const auto& fg = global_final_groups_2d[i];
 
-					// Build display strings
 					std::string s_l1, s_l2;
 					for (int pi = 0; pi < (int)fg.l1_side.size(); ++pi) {
 						if (pi) s_l1 += " ";
@@ -4550,15 +4821,13 @@ int main() {
 						if (pp.contour_ids.size() == 1) {
 							s_l2 += std::to_string(forest_l2[pp.contour_ids[0]].contourId + 1);
 						} else {
-							s_l2 += "(";
-							for (int cid : pp.contour_ids) s_l2 += std::to_string(forest_l2[cid].contourId + 1);
-							s_l2 += ")";
+							s_l2 += "(" + fmt_l2(pp.contour_ids) + ")";
 						}
 					}
 
-					ImGui::Text("%d. {%s} vs {%s}",
-						i + 1, s_l1.c_str(), s_l2.c_str());
+					ImGui::Text("%d. {%s} vs {%s}", i + 1, s_l1.c_str(), s_l2.c_str());
 				}
+
 				ImGui::EndChild();
 				ImGui::SetWindowFontScale(1.0f);
 				ImGui::End();
@@ -4593,6 +4862,9 @@ int main() {
 
 		// Ã¢Å“â€¦ NUEVO: Callback para el Viewer 4 (SuperposiciÃƒÂ³n)
 		menu_overlay.callback_draw_viewer_window = [&]() {
+			if (!enable_2d_analysis) {
+				ImGui::Begin("Overlay"); ImGui::Text("2D analysis disabled"); ImGui::End(); return;
+			}
 			ImGui::Begin("Overlay (L1 + L2)");
 
 			ImGui::TextColored(ImVec4(0.0f, 0.0f, 0.0f, 1.0f), "Level L1: Black");
@@ -4712,6 +4984,7 @@ int main() {
 		// VIEWER 5: HOLE vs HOLE - CALLBACK
 		// =========================
 		menu_hh.callback_draw_viewer_window = [&]() {
+			if (!enable_2d_analysis) return;
 			ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
 			ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.95f, 0.95f, 0.95f, 1.0f));
 			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
@@ -4762,6 +5035,7 @@ int main() {
 		// VIEWER 6: HOLE vs SOLID - CALLBACK
 		// =========================
 		menu_hs.callback_draw_viewer_window = [&]() {
+			if (!enable_2d_analysis) return;
 			ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
 			ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.95f, 0.95f, 0.95f, 1.0f));
 			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
@@ -5225,6 +5499,10 @@ int main() {
 		double z_l1 = levels[startIdx - 1].zCoord;
 		double z_l2 = levels[startIdx].zCoord;
 
+		// Use resampled contours for all 3D reconstruction (work contours)
+		const auto& work_contours_l1 = (resampleFactor > 1) ? resampled_l1 : levels[startIdx - 1].contours;
+		const auto& work_contours_l2 = (resampleFactor > 1) ? resampled_l2 : levels[startIdx].contours;
+
 		// =========================
 		// ALGORITHM 3: PER-GROUP RECONSTRUCTION
 		// =========================
@@ -5259,6 +5537,9 @@ int main() {
 
 				if (gc_l1.empty() || gc_l2.empty()) { std::cout << "  Skipped (empty side)\n"; continue; }
 
+				auto gc_l1_work = resample_contours(gc_l1, resampleFactor);
+				auto gc_l2_work = resample_contours(gc_l2, resampleFactor);
+
 				// Build solidpolygon structs with LOCAL contour indices
 				std::vector<solidpolygon> gp_l1, gp_l2;
 				std::vector<polygon_reference> gr_l1, gr_l2;
@@ -5282,16 +5563,16 @@ int main() {
 				}
 
 				SolidRegionGrid gg_l1, gg_l2;
-				gg_l1.precompute(gr_l1, gp_l1, gc_l1);
-				gg_l2.precompute(gr_l2, gp_l2, gc_l2);
+				gg_l1.precompute(gr_l1, gp_l1, gc_l1_work);
+				gg_l2.precompute(gr_l2, gp_l2, gc_l2_work);
 
-				auto gr_vor_l1 = compute_voronoi_edges(resample_contours(gc_l1, resampleFactor));
-				auto gma_l1 = classify_voronoi_edges(gr_vor_l1, gr_l1, gp_l1, gc_l1, &gg_l1);
-				auto gr_vor_l2 = compute_voronoi_edges(resample_contours(gc_l2, resampleFactor));
-				auto gma_l2 = classify_voronoi_edges(gr_vor_l2, gr_l2, gp_l2, gc_l2, &gg_l2);
+				auto gr_vor_l1 = compute_voronoi_edges(gc_l1_work);
+				auto gma_l1 = classify_voronoi_edges(gr_vor_l1, gr_l1, gp_l1, gc_l1_work, &gg_l1);
+				auto gr_vor_l2 = compute_voronoi_edges(gc_l2_work);
+				auto gma_l2 = classify_voronoi_edges(gr_vor_l2, gr_l2, gp_l2, gc_l2_work, &gg_l2);
 
-				auto gproj_l2_on_l1 = compute_ema_projection(gma_l2.ema_edges, gr_l1, gp_l1, gc_l1, &gg_l1);
-				auto gproj_l1_on_l2 = compute_ema_projection(gma_l1.ema_edges, gr_l2, gp_l2, gc_l2, &gg_l2);
+				auto gproj_l2_on_l1 = compute_ema_projection(gma_l2.ema_edges, gr_l1, gp_l1, gc_l1_work, &gg_l1);
+				auto gproj_l1_on_l2 = compute_ema_projection(gma_l1.ema_edges, gr_l2, gp_l2, gc_l2_work, &gg_l2);
 
 				std::cout << "  IMA_L1=" << gma_l1.ima_edges.size()
 					<< " IMA_L2=" << gma_l2.ima_edges.size()
@@ -5300,12 +5581,12 @@ int main() {
 
 				// Augmented points (LOCAL z from levels)
 				std::vector<Eigen::Vector3d> gaug_l1, gaug_l2;
-				for (const auto& c : resample_contours(gc_l1, resampleFactor)) for (const auto& p : c.points) gaug_l1.push_back(p);
+				for (const auto& c : gc_l1_work) for (const auto& p : c.points) gaug_l1.push_back(p);
 				index_t g_contour_l1 = (index_t)gaug_l1.size(); // contour pts count before IMA
 				for (const auto& e : gma_l1.ima_edges) { gaug_l1.emplace_back(e.first.x,e.first.y,z_l1); gaug_l1.emplace_back(e.second.x,e.second.y,z_l1); }
 				index_t g_ima_end_l1 = (index_t)gaug_l1.size(); // end of IMA in L1
 				for (const auto& v : gproj_l2_on_l1.solid_vertices) gaug_l1.emplace_back(v.x(),v.y(),z_l1);
-				for (const auto& c : resample_contours(gc_l2, resampleFactor)) for (const auto& p : c.points) gaug_l2.push_back(p);
+				for (const auto& c : gc_l2_work) for (const auto& p : c.points) gaug_l2.push_back(p);
 				index_t g_contour_l2 = (index_t)gaug_l2.size(); // contour pts count before IMA
 				for (const auto& e : gma_l2.ima_edges) { gaug_l2.emplace_back(e.first.x,e.first.y,z_l2); gaug_l2.emplace_back(e.second.x,e.second.y,z_l2); }
 				index_t g_ima_end_l2 = (index_t)gaug_l2.size(); // end of IMA in L2
@@ -5382,17 +5663,85 @@ int main() {
 						for (int lf=0;lf<4;++lf)
 							info.faces[lf]={voffset+(index_t)v[fv3[lf][0]],voffset+(index_t)v[fv3[lf][1]],voffset+(index_t)v[fv3[lf][2]]};
 						{
+							bool failed_same_level = false;
+
 							double mx1=(cg[3*vl1[0]]+cg[3*vl1[1]])*0.5,my1=(cg[3*vl1[0]+1]+cg[3*vl1[1]+1])*0.5;
 							Eigen::Vector2d m1(mx1,my1);
 							int r1=gg_l1.classify(mx1,my1);
-							if(r1<0&&point_near_contour_boundary(m1,gr_l1,gp_l1,gc_l1)) r1=0;
-							if(r1<0){info.fails_midpoint=true;}
+							if(r1<0&&point_near_contour_boundary(m1,gr_l1,gp_l1,gc_l1_work)) r1=0;
+							if(r1<0){failed_same_level=true;}
 							else{
 								double mx2=(cg[3*vl2[0]]+cg[3*vl2[1]])*0.5,my2=(cg[3*vl2[0]+1]+cg[3*vl2[1]+1])*0.5;
 								Eigen::Vector2d m2(mx2,my2);
 								int r2=gg_l2.classify(mx2,my2);
-								if(r2<0&&point_near_contour_boundary(m2,gr_l2,gp_l2,gc_l2)) r2=0;
-								if(r2<0) info.fails_midpoint=true;
+								if(r2<0&&point_near_contour_boundary(m2,gr_l2,gp_l2,gc_l2_work)) r2=0;
+								if(r2<0) failed_same_level=true;
+							}
+
+							// Cross-edge + centerline check
+							if (!failed_same_level) {
+								const double cross_t[3] = {0.25, 0.5, 0.75};
+								const int cross_pairs[4][2] = {{0,0},{0,1},{1,0},{1,1}};
+
+								int cross_failed_cnt = 0;
+								for (int cp = 0; cp < 4; ++cp) {
+									int li = cross_pairs[cp][0], l2i = cross_pairs[cp][1];
+									double ax = cg[3*vl1[li]],     ay = cg[3*vl1[li]+1];
+									double bx = cg[3*vl2[l2i]],     by = cg[3*vl2[l2i]+1];
+
+									bool all_outside = true;
+									for (int si = 0; si < 3 && all_outside; ++si) {
+										double mx = ax + cross_t[si] * (bx - ax);
+										double my = ay + cross_t[si] * (by - ay);
+
+										bool in_l1 = gg_l1.classify(mx, my) >= 0;
+										if (!in_l1) {
+											Eigen::Vector2d sp(mx, my);
+											if (point_near_contour_boundary(sp, gr_l1, gp_l1, gc_l1_work))
+												in_l1 = true;
+										}
+										bool in_l2 = gg_l2.classify(mx, my) >= 0;
+										if (!in_l2) {
+											Eigen::Vector2d sp(mx, my);
+											if (point_near_contour_boundary(sp, gr_l2, gp_l2, gc_l2_work))
+												in_l2 = true;
+										}
+										if (in_l1 || in_l2)
+											all_outside = false;
+									}
+									if (all_outside) cross_failed_cnt++;
+								}
+
+								// Centerline: midpoint L1-L1 -> midpoint L2-L2
+								double mid_l1_x = (cg[3*vl1[0]] + cg[3*vl1[1]]) * 0.5;
+								double mid_l1_y = (cg[3*vl1[0]+1] + cg[3*vl1[1]+1]) * 0.5;
+								double mid_l2_x = (cg[3*vl2[0]] + cg[3*vl2[1]]) * 0.5;
+								double mid_l2_y = (cg[3*vl2[0]+1] + cg[3*vl2[1]+1]) * 0.5;
+
+								bool centerline_all_outside = true;
+								for (int si = 0; si < 3 && centerline_all_outside; ++si) {
+									double mx = mid_l1_x + cross_t[si] * (mid_l2_x - mid_l1_x);
+									double my = mid_l1_y + cross_t[si] * (mid_l2_y - mid_l1_y);
+
+									bool in_l1 = gg_l1.classify(mx, my) >= 0;
+									if (!in_l1) {
+										Eigen::Vector2d sp(mx, my);
+										if (point_near_contour_boundary(sp, gr_l1, gp_l1, gc_l1_work))
+											in_l1 = true;
+									}
+									bool in_l2 = gg_l2.classify(mx, my) >= 0;
+									if (!in_l2) {
+										Eigen::Vector2d sp(mx, my);
+										if (point_near_contour_boundary(sp, gr_l2, gp_l2, gc_l2_work))
+											in_l2 = true;
+									}
+									if (in_l1 || in_l2) centerline_all_outside = false;
+								}
+
+								if (centerline_all_outside || cross_failed_cnt >= 3)
+									info.fails_midpoint = true;
+							} else {
+								info.fails_midpoint = true;
 							}
 						}
 						gt12.push_back(info);
@@ -5773,11 +6122,11 @@ int main() {
 			for (auto& grp : algo4_groups) {
 				grp.grid_l1.stored_poly_refs = &grp.refs_l1;
 				grp.grid_l1.stored_all_polys = &grp.polys_l1;
-				grp.grid_l1.stored_contours  = &levels[startIdx-1].contours;
+				grp.grid_l1.stored_contours  = &work_contours_l1;
 				grp.grid_l1.valid = true;
 				grp.grid_l2.stored_poly_refs = &grp.refs_l2;
 				grp.grid_l2.stored_all_polys = &grp.polys_l2;
-				grp.grid_l2.stored_contours  = &levels[startIdx].contours;
+				grp.grid_l2.stored_contours  = &work_contours_l2;
 				grp.grid_l2.valid = true;
 			}
 			std::cout << "  Built " << algo4_groups.size() << " affinity groups from 2D shape similarity\n";
@@ -5816,35 +6165,31 @@ int main() {
 			for (auto& grp : algo4_groups) {
 				grp.grid_l1.stored_poly_refs = &grp.refs_l1;
 				grp.grid_l1.stored_all_polys = &grp.polys_l1;
-				grp.grid_l1.stored_contours  = &levels[startIdx-1].contours;
+				grp.grid_l1.stored_contours  = &work_contours_l1;
 				grp.grid_l1.valid = true;
 				grp.grid_l2.stored_poly_refs = &grp.refs_l2;
 				grp.grid_l2.stored_all_polys = &grp.polys_l2;
-				grp.grid_l2.stored_contours  = &levels[startIdx].contours;
+				grp.grid_l2.stored_contours  = &work_contours_l2;
 				grp.grid_l2.valid = true;
 			}
 			std::cout << "  Grids built for " << algo4_groups.size() << " groups\n";
 		}
 
-		// Use resampled contours for Voronoi
-		const auto& vor_contours_l1 = (resampleFactor > 1) ? resampled_l1 : levels[startIdx - 1].contours;
-		const auto& vor_contours_l2 = (resampleFactor > 1) ? resampled_l2 : levels[startIdx].contours;
-
 		// Precompute solid region grids for O(1) point classification
 		SolidRegionGrid sp_vor_grid_l1, sp_vor_grid_l2;
-		sp_vor_grid_l1.precompute(polygon_refs_l1, all_polygons, levels[startIdx - 1].contours);
-		sp_vor_grid_l2.precompute(polygon_refs_l2, all_polygons, levels[startIdx].contours);
+		sp_vor_grid_l1.precompute(polygon_refs_l1, all_polygons, work_contours_l1);
+		sp_vor_grid_l2.precompute(polygon_refs_l2, all_polygons, work_contours_l2);
 		std::cout << "\nSolid region grids: L1=" << sp_vor_grid_l1.nx << "x" << sp_vor_grid_l1.ny
 			<< ", L2=" << sp_vor_grid_l2.nx << "x" << sp_vor_grid_l2.ny << "\n";
 
 		// =========================
 		// VORONOI L1 - DATA + CLASSIFY
 		// =========================
-		auto vor_edges_l1 = compute_voronoi_edges(vor_contours_l1);
+		auto vor_edges_l1 = compute_voronoi_edges(work_contours_l1);
 		medial_axes_result ma_l1;
 		{
 
-			for (const auto& contour : vor_contours_l1) {
+			for (const auto& contour : work_contours_l1) {
 				int n = static_cast<int>(contour.points.size());
 				if (n == 0) continue;
 				Eigen::MatrixXd V(n, 3);
@@ -5872,7 +6217,7 @@ int main() {
 			// Classify into IMA / EMA
 			ma_l1 = classify_voronoi_edges(
 				vor_edges_l1, polygon_refs_l1, all_polygons,
-				levels[startIdx - 1].contours, &sp_vor_grid_l1);
+				work_contours_l1, &sp_vor_grid_l1);
 
 			ima_l1_count = static_cast<int>(ma_l1.ima_edges.size());
 			ema_l1_count = static_cast<int>(ma_l1.ema_edges.size());
@@ -5954,11 +6299,11 @@ int main() {
 		// =========================
 		// VORONOI L2 - DATA + CLASSIFY
 		// =========================
-		auto vor_edges_l2 = compute_voronoi_edges(vor_contours_l2);
+		auto vor_edges_l2 = compute_voronoi_edges(work_contours_l2);
 		medial_axes_result ma_l2;
 		{
 
-			for (const auto& contour : vor_contours_l2) {
+			for (const auto& contour : work_contours_l2) {
 				int n = static_cast<int>(contour.points.size());
 				if (n == 0) continue;
 				Eigen::MatrixXd V(n, 3);
@@ -5986,7 +6331,7 @@ int main() {
 			// Classify into IMA / EMA
 			ma_l2 = classify_voronoi_edges(
 				vor_edges_l2, polygon_refs_l2, all_polygons,
-				levels[startIdx].contours, &sp_vor_grid_l2);
+				work_contours_l2, &sp_vor_grid_l2);
 
 			ima_l2_count = static_cast<int>(ma_l2.ima_edges.size());
 			ema_l2_count = static_cast<int>(ma_l2.ema_edges.size());
@@ -6072,12 +6417,12 @@ int main() {
 		// EMA L1 projected onto L2
 		ema_projection_result proj_ema_l1_on_l2 = compute_ema_projection(
 			ma_l1.ema_edges, polygon_refs_l2, all_polygons,
-			levels[startIdx].contours, &sp_vor_grid_l2);
+			work_contours_l2, &sp_vor_grid_l2);
 
 		// EMA L2 projected onto L1
 		ema_projection_result proj_ema_l2_on_l1 = compute_ema_projection(
 			ma_l2.ema_edges, polygon_refs_l1, all_polygons,
-			levels[startIdx - 1].contours, &sp_vor_grid_l1);
+			work_contours_l1, &sp_vor_grid_l1);
 
 		std::cout << "\n=================================\n";
 		std::cout << "EMA PROJECTION\n";
@@ -6090,7 +6435,7 @@ int main() {
 		// Build augmented points L1
 		augmented_points_l1.clear();
 		{
-			const auto& src = (resampleFactor > 1) ? resampled_l1 : levels[startIdx - 1].contours;
+			const auto& src = work_contours_l1;
 			for (const auto& c : src)
 				for (const auto& p : c.points)
 					augmented_points_l1.push_back(p);
@@ -6112,7 +6457,7 @@ int main() {
 		// Build augmented points L2
 		augmented_points_l2.clear();
 		{
-			const auto& src = (resampleFactor > 1) ? resampled_l2 : levels[startIdx].contours;
+			const auto& src = work_contours_l2;
 			for (const auto& c : src)
 				for (const auto& p : c.points)
 					augmented_points_l2.push_back(p);
@@ -6290,8 +6635,8 @@ int main() {
 				// =========================
 				// FILTER T1 and T2 tetrahedra
 				// =========================
-				const auto& filter_contours_l1 = levels[startIdx - 1].contours;
-				const auto& filter_contours_l2 = levels[startIdx].contours;
+				const auto& filter_contours_l1 = work_contours_l1;
+				const auto& filter_contours_l2 = work_contours_l2;
 
 				// Reuse grids from outer scope (sp_vor_grid_l1/l2)
 				const auto& sp_grid_l1 = sp_vor_grid_l1;
@@ -6461,7 +6806,11 @@ int main() {
 				{
 					std::cout << "\nT12 filter:\n";
 
-					int t12_edge_not_in_solid = 0;
+					int t12_same_level_midpoint_failed = 0;
+					int t12_cross_edge_ge1 = 0;
+					int t12_cross_edge_ge2 = 0;
+					int t12_cross_edge_ge3 = 0;
+					int t12_centerline_failed = 0;
 					int t12_isolated_count = 0;
 
 					global_t12_tets.clear();
@@ -6499,9 +6848,12 @@ int main() {
 							};
 						}
 
-						// Midpoint filter: midpoint of each Delaunay edge must be in solid region
-						// Points on the contour boundary are treated as inside (not void)
+						// Midpoint filter: L1-L1 and L2-L2 segments must be in solid
+						// Plus cross-edge L1-L2 check to catch external flap tets
 						{
+							bool failed_same_level = false;
+
+							// --- Same-level check (existing) ---
 							double mx_l1 = (coords_3d[3 * verts_l1_global[0]]     + coords_3d[3 * verts_l1_global[1]])     * 0.5;
 							double my_l1 = (coords_3d[3 * verts_l1_global[0] + 1] + coords_3d[3 * verts_l1_global[1] + 1]) * 0.5;
 							Eigen::Vector2d mid_l1(mx_l1, my_l1);
@@ -6519,8 +6871,85 @@ int main() {
 									region_l2 = 0;
 
 							if (region_l1 < 0 || region_l2 < 0) {
+								failed_same_level = true;
+								t12_same_level_midpoint_failed++;
+							}
+
+							// --- Cross-edge + centerline check ---
+							if (!failed_same_level) {
+								const double cross_t[3] = {0.25, 0.5, 0.75};
+								struct CrossPair { int li, l2i; };
+								CrossPair cross_pairs[4] = {{0,0},{0,1},{1,0},{1,1}};
+
+								int cross_failed_cnt = 0;
+								for (int cp = 0; cp < 4; ++cp) {
+									index_t v_l1 = verts_l1_global[cross_pairs[cp].li];
+									index_t v_l2 = verts_l2_global[cross_pairs[cp].l2i];
+									double ax = coords_3d[3*v_l1],     ay = coords_3d[3*v_l1+1];
+									double bx = coords_3d[3*v_l2],     by = coords_3d[3*v_l2+1];
+
+									bool all_outside = true;
+									for (int si = 0; si < 3 && all_outside; ++si) {
+										double mx = ax + cross_t[si] * (bx - ax);
+										double my = ay + cross_t[si] * (by - ay);
+
+										bool in_l1 = sp_grid_l1.classify(mx, my) >= 0;
+										if (!in_l1) {
+											Eigen::Vector2d sp(mx, my);
+											if (point_near_contour_boundary(sp, polygon_refs_l1, all_polygons, filter_contours_l1))
+												in_l1 = true;
+										}
+										bool in_l2 = sp_grid_l2.classify(mx, my) >= 0;
+										if (!in_l2) {
+											Eigen::Vector2d sp(mx, my);
+											if (point_near_contour_boundary(sp, polygon_refs_l2, all_polygons, filter_contours_l2))
+												in_l2 = true;
+										}
+										if (in_l1 || in_l2)
+											all_outside = false;
+									}
+									if (all_outside) cross_failed_cnt++;
+								}
+
+								if (cross_failed_cnt >= 1) t12_cross_edge_ge1++;
+								if (cross_failed_cnt >= 2) t12_cross_edge_ge2++;
+								if (cross_failed_cnt >= 3) t12_cross_edge_ge3++;
+
+								// Centerline: midpoint L1-L1 -> midpoint L2-L2
+								double mid_l1_x = (coords_3d[3*verts_l1_global[0]] + coords_3d[3*verts_l1_global[1]]) * 0.5;
+								double mid_l1_y = (coords_3d[3*verts_l1_global[0]+1] + coords_3d[3*verts_l1_global[1]+1]) * 0.5;
+								double mid_l2_x = (coords_3d[3*verts_l2_global[0]] + coords_3d[3*verts_l2_global[1]]) * 0.5;
+								double mid_l2_y = (coords_3d[3*verts_l2_global[0]+1] + coords_3d[3*verts_l2_global[1]+1]) * 0.5;
+
+								bool centerline_all_outside = true;
+								for (int si = 0; si < 3 && centerline_all_outside; ++si) {
+									double mx = mid_l1_x + cross_t[si] * (mid_l2_x - mid_l1_x);
+									double my = mid_l1_y + cross_t[si] * (mid_l2_y - mid_l1_y);
+
+									bool in_l1 = sp_grid_l1.classify(mx, my) >= 0;
+									if (!in_l1) {
+										Eigen::Vector2d sp(mx, my);
+										if (point_near_contour_boundary(sp, polygon_refs_l1, all_polygons, filter_contours_l1))
+											in_l1 = true;
+									}
+									bool in_l2 = sp_grid_l2.classify(mx, my) >= 0;
+									if (!in_l2) {
+										Eigen::Vector2d sp(mx, my);
+										if (point_near_contour_boundary(sp, polygon_refs_l2, all_polygons, filter_contours_l2))
+											in_l2 = true;
+									}
+									if (in_l1 || in_l2) centerline_all_outside = false;
+								}
+
+								if (centerline_all_outside) {
+									t12_centerline_failed++;
+									info.fails_midpoint = true;
+								} else if (cross_failed_cnt >= 3) {
+									t12_cross_edge_ge3++; // already counted above, reuse for removal
+									info.fails_midpoint = true;
+								}
+							} else {
 								info.fails_midpoint = true;
-								t12_edge_not_in_solid++;
 							}
 						}
 
@@ -6646,7 +7075,12 @@ int main() {
 					}
 
 					std::cout << "  T12 diagnostic:\n";
-					std::cout << "    Edge midpt not in solid: " << t12_edge_not_in_solid << "\n";
+					std::cout << "    Same-level midpoint failed: " << t12_same_level_midpoint_failed << "\n";
+					std::cout << "    Cross-edge failed >=1:      " << t12_cross_edge_ge1 << "\n";
+					std::cout << "    Cross-edge failed >=2:      " << t12_cross_edge_ge2 << "\n";
+					std::cout << "    Cross-edge failed >=3 rem:  " << t12_cross_edge_ge3 << "\n";
+					std::cout << "    Centerline failed removed:  " << t12_centerline_failed << "\n";
+					std::cout << "    Total midpoint failed:      " << (t12_same_level_midpoint_failed + t12_centerline_failed + t12_cross_edge_ge3) << "\n";
 				}
 
 				// Build vertex matrix (shared by all viewers)
@@ -7213,15 +7647,16 @@ int main() {
 					std::cout << "  Result: " << (global_manifold_info.is_manifold() ? "MANIFOLD" : "NOT MANIFOLD") << "\n";
 					std::cout << "  =========================\n";
 
-					// =========================
-					// GAP FILL: create new T12 tets to close holes caused by IMA apex vertices
-					// Strategy:
-					//   1. Find non-manifold edges where one vertex is on the contour and the other is an internal (IMA/EMA) point
-					//   2. Find the 2 faces sharing that edge; their 3rd vertices are on the opposite level's contour
-					//   3. Walk the SHORT path along that opposite-level contour between those 2 vertices (only contour vertices)
-					//   4. Create T12 tets: non-manifold edge segment x each contour segment along the short path
-					// =========================
-					if (!global_manifold_info.is_manifold() && !global_manifold_info.non_manifold_edge_list.empty()) {
+				// =========================
+				// GAP FILL: create new T12 tets to close holes caused by IMA apex vertices
+				// Strategy:
+				//   1. Find non-manifold edges where one vertex is on the contour and the other is an internal (IMA/EMA) point
+				//   2. Find the 2 faces sharing that edge; their 3rd vertices are on the opposite level's contour
+				//   3. Walk the SHORT path along that opposite-level contour between those 2 vertices (only contour vertices)
+				//   4. Create T12 tets: non-manifold edge segment x each contour segment along the short path
+				// =========================
+				const bool enable_gap_fill_repair = false;
+				if (enable_gap_fill_repair && !global_manifold_info.is_manifold() && !global_manifold_info.non_manifold_edge_list.empty()) {
 						std::cout << "\n  === GAP FILL REPAIR ===\n";
 
 						// Build reverse map: reindexed vertex -> original vertex
@@ -7230,8 +7665,8 @@ int main() {
 							new_to_old_repair[kv.second] = kv.first;
 
 						// Build contour vertex lookup tables
-						const auto& contours_src_l1 = (resampleFactor > 1) ? resampled_l1 : levels[startIdx - 1].contours;
-						const auto& contours_src_l2 = (resampleFactor > 1) ? resampled_l2 : levels[startIdx].contours;
+						const auto& contours_src_l1 = work_contours_l1;
+						const auto& contours_src_l2 = work_contours_l2;
 
 						// Build per-contour offset tables
 						// contour_offsets_lX[c] = first global index of contour c
@@ -9008,9 +9443,9 @@ int main() {
 			{ &viewer_l1,            ENABLE_VIEWER_L1 },
 			{ &viewer_l2,            ENABLE_VIEWER_L2 },
 			{ &viewer_intersection,  ENABLE_VIEWER_INTERSECTION },
-			{ &viewer_overlay,       ENABLE_VIEWER_OVERLAY },
-			{ &viewer_hh,            ENABLE_VIEWER_HH },
-			{ &viewer_hs,            ENABLE_VIEWER_HS },
+			{ &viewer_overlay,       enable_2d_analysis && ENABLE_VIEWER_OVERLAY },
+			{ &viewer_hh,            enable_2d_analysis && ENABLE_VIEWER_HH },
+			{ &viewer_hs,            enable_2d_analysis && ENABLE_VIEWER_HS },
 			{ &viewer_vor_l1,        ENABLE_VIEWER_VOR_L1 },
 			{ &viewer_vor_l2,        ENABLE_VIEWER_VOR_L2 },
 			{ &viewer_ima_l1,        ENABLE_VIEWER_IMA_L1 },
